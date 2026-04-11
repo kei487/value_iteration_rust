@@ -12,12 +12,12 @@ import struct
 import numpy as np
 from pynq import Overlay, allocate
 
-# AXI-Lite register offsets (from HLS-generated driver header)
-# These will be confirmed after HLS synthesis from the *_hw.h file.
+# AXI-Lite register offsets — verified against HLS synthesis report
+# (hls_build/hls/syn/report/csynth.rpt, Vitis HLS 2025.2)
 AP_CTRL          = 0x00
-ADDR_VALUE_TABLE = 0x10  # 64-bit address
-ADDR_PENALTY     = 0x1C  # 64-bit address
-ADDR_TRANS       = 0x28  # 64-bit address
+ADDR_VALUE_TABLE = 0x10  # 64-bit address (upper at 0x14)
+ADDR_PENALTY     = 0x1C  # 64-bit address (upper at 0x20)
+ADDR_TRANS       = 0x28  # 64-bit address (upper at 0x2C)
 ADDR_MAP_X       = 0x34
 ADDR_MAP_Y       = 0x3C
 ADDR_NUM_TILES_X = 0x44

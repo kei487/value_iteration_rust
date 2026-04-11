@@ -1,6 +1,9 @@
 # HLS build artifacts
 fpga/scripts/hls_build/
+fpga/hls/vi_sweep/hls_build/
 fpga/hls/vi_sweep/solution*/
+fpga/hls/vi_sweep/dfx_runtime.txt
+fpga/hls/vi_sweep/.Xil/
 
 # Vivado project artifacts
 fpga/vivado/ultra96v2/vi_ultra96v2/
