@@ -37,10 +37,15 @@ void compute_bellman(
     // Transition table fully in registers.
     #pragma HLS ARRAY_PARTITION variable=delta_table complete dim=0
 
+    // Inter-iteration dependence on val_buf is actually distance >= 3
+    // (rotation actions read [it+/-3]), so HLS can pipeline more aggressively.
+    #pragma HLS DEPENDENCE variable=val_buf type=inter false
+
     value_t local_max_delta = 0;
 
     LOOP_Y: for (int iy = 0; iy < tile_h; iy++) {
         LOOP_X: for (int ix = 0; ix < tile_w; ix++) {
+            #pragma HLS LOOP_FLATTEN off
             int by = iy + HALO;
             int bx = ix + HALO;
 
