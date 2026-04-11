@@ -168,11 +168,51 @@ int vi_run_until_converged(vi_device_t *dev,
     return converged ? VI_OK : VI_ERR_NOT_CONV;
 }
 
-/* Stub — implemented in Task 6. */
 int vi_compute_action_table(vi_device_t *dev, int map_x, int map_y,
                             uint8_t *action_out) {
-    (void)dev; (void)map_x; (void)map_y; (void)action_out;
-    return VI_ERR_BAD_ARG;
+    if (!dev || !action_out || map_x <= 0 || map_y <= 0) return VI_ERR_BAD_ARG;
+    if ((size_t)map_x * map_y * VI_N_THETA * 2 > dev->value_size)
+        return VI_ERR_BUF_SIZE;
+
+    const uint16_t *val   = dev->value_buf;
+    const uint16_t *pen   = dev->pen_buf;
+    const uint32_t *trans = dev->trans_buf;
+
+    for (int y = 0; y < map_y; y++) {
+        for (int x = 0; x < map_x; x++) {
+            uint16_t cell_pen = pen[y * map_x + x];
+            for (int it = 0; it < VI_N_THETA; it++) {
+                size_t out_idx = ((size_t)y * map_x + x) * VI_N_THETA + it;
+
+                /* Obstacle or goal: fallback to action 0 (caller ignores). */
+                if (cell_pen >= 0xFFFE) {
+                    action_out[out_idx] = 0;
+                    continue;
+                }
+
+                uint16_t best_cost = 0xFFFF;
+                uint8_t  best_act  = 0;
+                for (int a = 0; a < VI_N_ACTIONS; a++) {
+                    uint32_t t = trans[a * VI_N_THETA + it];
+                    int8_t dix = (int8_t)(t & 0xFF);
+                    int8_t diy = (int8_t)((t >> 8) & 0xFF);
+                    int8_t dit = (int8_t)((t >> 16) & 0xFF);
+                    int nx = x + dix, ny = y + diy, nt = it + dit;
+                    if (nt < 0) nt += VI_N_THETA;
+                    if (nt >= VI_N_THETA) nt -= VI_N_THETA;
+                    if (nx < 0 || nx >= map_x || ny < 0 || ny >= map_y) continue;
+
+                    size_t nidx = ((size_t)ny * map_x + nx) * VI_N_THETA + nt;
+                    uint16_t nv = val[nidx];
+                    if (nv >= best_cost) continue;
+                    best_cost = nv;
+                    best_act  = (uint8_t)a;
+                }
+                action_out[out_idx] = best_act;
+            }
+        }
+    }
+    return VI_OK;
 }
 
 const char* vi_strerror(int code) {
