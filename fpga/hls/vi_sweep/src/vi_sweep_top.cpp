@@ -42,7 +42,7 @@ extern "C" void vi_sweep(
     // -----------------------------------------------------------------------
     value_t val_buf[TILE_H_H][TILE_W_H][N_THETA];
     #pragma HLS ARRAY_PARTITION variable=val_buf complete dim=3
-    #pragma HLS BIND_STORAGE variable=val_buf type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=val_buf type=ram_t2p impl=bram
 
     // 3 copies of penalty for parallel read (2 reads per copy via ram_2p)
     penalty_t pen_buf_0[TILE_H_H][TILE_W_H];
