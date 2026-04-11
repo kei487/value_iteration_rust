@@ -26,7 +26,7 @@
 #define VI_OFF_NUM_TILES_X   0x44
 #define VI_OFF_NUM_TILES_Y   0x4C
 #define VI_OFF_CU_ID         0x54
-#define VI_OFF_MAX_DELTA     0x60
+#define VI_OFF_MAX_DELTA     0x5C
 
 #define AP_START  0x1
 #define AP_DONE   0x2

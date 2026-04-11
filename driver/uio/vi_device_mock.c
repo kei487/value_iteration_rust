@@ -21,7 +21,7 @@
 #define MOCK_NUM_TILES_X    0x44
 #define MOCK_NUM_TILES_Y    0x4C
 #define MOCK_CU_ID          0x54
-#define MOCK_MAX_DELTA      0x60
+#define MOCK_MAX_DELTA      0x5C
 
 #define MOCK_REG_BYTES      0x100
 
