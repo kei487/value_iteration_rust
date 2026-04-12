@@ -1,14 +1,7 @@
 # HLS build artifacts
-fpga/scripts/hls_build_tile/
-fpga/scripts/hls_build_stream/
-fpga/hls/vi_sweep_tile/hls_build/
-fpga/hls/vi_sweep_tile/solution*/
-fpga/hls/vi_sweep_tile/dfx_runtime.txt
-fpga/hls/vi_sweep_tile/.Xil/
-fpga/hls/vi_sweep_stream/hls_build*/
-fpga/hls/vi_sweep_stream/solution*/
-fpga/hls/vi_sweep_stream/.Xil/
-fpga/scripts/.hls.failed
+fpga/**/solution*/
+fpga/**/hls_build*/
+.hls.failed
 dfx_runtime.txt
 
 # EDF / PetaLinux build artifacts
