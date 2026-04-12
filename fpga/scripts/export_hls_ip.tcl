@@ -4,11 +4,11 @@
 # ===========================================================================
 
 set script_dir [file normalize [file dirname [info script]]]
-set hls_dir    [file normalize "$script_dir/../hls/vi_sweep"]
+set hls_dir    [file normalize "$script_dir/../hls/vi_sweep_tile"]
 set ip_dst     [file normalize "$script_dir/../vivado/ultra96v2/ip_repo"]
 set part       "xczu3eg-sbva484-1-i"
 
-open_project -reset hls_build
+open_project -reset hls_build_tile
 set_top vi_sweep
 add_files "$hls_dir/src/vi_sweep_top.cpp"
 add_files "$hls_dir/src/compute_bellman.cpp"

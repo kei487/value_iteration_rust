@@ -21,16 +21,18 @@ Top-level `Makefile` delegates to `driver/uio/` and `host/`. Run from the repo r
 
 Tools must be on `PATH` — invoke bare `vitis_hls` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`.
 
-- `make -C fpga/scripts csim` — HLS C-simulation of `fpga/hls/vi_sweep/tb/vi_sweep_tb.cpp` against `tb/vi_reference.cpp`.
-- `make -C fpga/scripts hls` — HLS synth + IP export into `fpga/hls/vi_sweep/hls_build/`.
+- `make -C fpga/scripts csim` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
+- `make -C fpga/scripts csim_stream` — HLS C-simulation of streaming kernel (`fpga/hls/vi_sweep_stream/`).
+- `make -C fpga/scripts hls` — HLS synth + IP export (tile-based) into `fpga/scripts/hls_build_tile/`.
+- `make -C fpga/scripts hls_stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`.
 - `make -C fpga/scripts vivado` (or `bitstream`) — runs HLS then `build_vivado.tcl` to produce the Ultra96-V2 bitstream under `fpga/vivado/ultra96v2/vi_ultra96v2/`.
 - After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header` (copies `xvi_sweep_hw.h` into `driver/uio/generated/`; review the diff).
 
 ## Architecture
 
-Four vertically integrated layers share the same 16-bit data contract defined in `fpga/hls/vi_sweep/src/vi_types.h`. Keep them in sync.
+Four vertically integrated layers share the same 16-bit data contract defined in `fpga/hls/vi_sweep_tile/src/vi_types.h` (tile-based) and `fpga/hls/vi_sweep_stream/src/vi_stream_types.h` (streaming). Keep them in sync.
 
-### 1. HLS kernel (`fpga/hls/vi_sweep/`)
+### 1. HLS kernel (`fpga/hls/vi_sweep_tile/` and `fpga/hls/vi_sweep_stream/`)
 Dataflow kernel `vi_sweep_top` = `load_tiles` → `compute_bellman` → `store_tiles`, processing 32×32 tiles with a 6-cell halo (TILE_W_H = 44). Two CUs are instantiated in the Vivado BD for red/black tile sweeping. Datatypes: `value_t`/`penalty_t` are `ap_uint<16>`; offsets `ap_int<8>`. Sentinels: `PENALTY_OBSTACLE = 0xFFFF` (impassable); `PENALTY_GOAL = 0xFFFE` — **when read as a neighbor's penalty it must be treated as 0** so the goal cell's value stays pinned at 0 (this convention is load-bearing; see the testbench and `host/src/penalty.c`). Transition table is a packed `(dix, diy, dit)` word per `(action, theta)` — 6×60 = 360 entries, precomputed on ARM and DMA'd into the kernel.
 
 ### 2. Device layer (`driver/uio/`)

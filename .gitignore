@@ -1,10 +1,10 @@
 # HLS build artifacts
-fpga/scripts/hls_build/
+fpga/scripts/hls_build_tile/
 fpga/scripts/hls_build_stream/
-fpga/hls/vi_sweep/hls_build/
-fpga/hls/vi_sweep/solution*/
-fpga/hls/vi_sweep/dfx_runtime.txt
-fpga/hls/vi_sweep/.Xil/
+fpga/hls/vi_sweep_tile/hls_build/
+fpga/hls/vi_sweep_tile/solution*/
+fpga/hls/vi_sweep_tile/dfx_runtime.txt
+fpga/hls/vi_sweep_tile/.Xil/
 fpga/hls/vi_sweep_stream/hls_build*/
 fpga/hls/vi_sweep_stream/solution*/
 fpga/hls/vi_sweep_stream/.Xil/

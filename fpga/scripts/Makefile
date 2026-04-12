@@ -19,7 +19,7 @@ vivado: hls
 bitstream: vivado
 
 clean_hls:
-	rm -rf $(SCRIPTS_DIR)/hls_build
+	rm -rf $(SCRIPTS_DIR)/hls_build_tile
 
 clean_vivado:
 	rm -rf $(SCRIPTS_DIR)/../vivado/ultra96v2/vi_ultra96v2
