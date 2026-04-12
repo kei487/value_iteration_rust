@@ -48,7 +48,7 @@ $(LIBVI_MOCK):
 	$(MAKE) -C ../driver/uio mock-only
 
 test/%: test/%.c src/map_pgm.c src/penalty.c src/transitions.c src/vi_reference_c.c $(LIBVI_MOCK)
-	$(CC) $(CFLAGS) -DVI_TEST -o $@ $^
+	$(CC) $(CFLAGS) -DVI_MOCK_ONLY -DVI_TEST -o $@ $^ -lm
 
 %.run: %
 	@echo "--- Running $< ---"
@@ -61,4 +61,4 @@ test-hw:
 	bash test/hw/run_big.sh
 
 clean:
-	rm -f src/*.o test/*.o $(CLI_BIN) $(TEST_BINS)
+	rm -f src/*.o test/*.o $(CLI_BIN) vi_cli_mock $(TEST_BINS)

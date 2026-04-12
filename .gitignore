@@ -14,6 +14,21 @@ fpga/pynq/*.hwh
 fpga/vivado/ultra96v2/vi_ultra96v2/
 fpga/vivado/ultra96v2/ip_repo/
 
+# Phase 3 C build artifacts
+*.o
+driver/uio/*.a
+driver/uio/*.so
+
+# Phase 3 compiled binaries
+host/vi_cli
+host/vi_cli_mock
+host/test/test_map_pgm
+host/test/test_penalty
+host/test/test_transitions
+host/test/test_vi_run_mock
+host/test/test_action_table
+host/test/test_reference_eq
+
 # OS
 .Xil/
 *.jou
