@@ -1,22 +1,22 @@
 # ===========================================================================
-# create_project.tcl — Ultra96-V2 Vivado project with vi_sweep IP
+# create_project_stream.tcl — Ultra96-V2 Vivado project (streaming kernel)
 # ===========================================================================
 
-set project_name "vi_ultra96v2"
+set project_name "vi_stream"
 set project_dir  [file normalize [file dirname [info script]]]
-set ip_repo_dir  [file normalize "$project_dir/ip_repo"]
+set ip_repo_dir  [file normalize "$project_dir/ip_repo_stream"]
 set part         "xczu3eg-sbva484-1-i"
 
 create_project $project_name "$project_dir/$project_name" -part $part -force
 
 set_property board_part Avnet-tria:Ultra96v2:part0:1.3 [current_project]
 
-# Add HLS IP repo (contains vi_sweep IP)
+# Add HLS IP repo (contains vi_sweep_stream IP)
 set_property ip_repo_paths $ip_repo_dir [current_project]
 update_ip_catalog
 
 # Source block design
-source "$project_dir/create_bd.tcl"
+source "$project_dir/create_bd_stream.tcl"
 
 # Generate output products
 generate_target all [get_files vi_bd.bd]

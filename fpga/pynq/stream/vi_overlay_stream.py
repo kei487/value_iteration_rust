@@ -31,8 +31,8 @@ def _write_addr64(ip, offset, addr):
 class VIOverlay:
     def __init__(self, bitstream_path: str):
         self.ol = Overlay(bitstream_path)
-        self.cu0 = self.ol.vi_sweep_stream_cu0
-        self.cu1 = self.ol.vi_sweep_stream_cu1
+        self.cu0 = self.ol.vi_sweep_cu0
+        self.cu1 = self.ol.vi_sweep_cu1
 
     def run(
         self,

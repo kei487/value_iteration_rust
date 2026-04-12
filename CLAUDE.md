@@ -17,15 +17,16 @@ Top-level `Makefile` delegates to `driver/uio/` and `host/`. Run from the repo r
 - Run a single host test: `make -C host test/test_penalty.run` (pattern: `test/<name>.run`).
 - Host-only CLI with the mock backend (no UIO needed, useful for local debugging): `make -C host cli-mock` → `host/vi_cli_mock`.
 
-### FPGA build (`fpga/scripts/Makefile`)
+### FPGA build (`fpga/Makefile`)
 
-Tools must be on `PATH` — invoke bare `vitis_hls` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`.
+Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`. Tile and streaming kernels have fully separate build paths.
 
-- `make -C fpga csim` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
+- `make -C fpga csim_tile` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
 - `make -C fpga csim_stream` — HLS C-simulation of streaming kernel (`fpga/hls/vi_sweep_stream/`).
-- `make -C fpga hls` — HLS synth + IP export (tile-based) into `fpga/scripts/hls_build_tile/`.
-- `make -C fpga hls_stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`.
-- `make -C fpga vivado` (or `bitstream`) — runs HLS then `build_vivado.tcl` to produce the Ultra96-V2 bitstream under `fpga/vivado/ultra96v2/vi_ultra96v2/`.
+- `make -C fpga hls_tile` — HLS synth + IP export (tile) into `fpga/scripts/hls_build_tile/`, IP to `ip_repo_tile/`.
+- `make -C fpga hls_stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`, IP to `ip_repo_stream/`.
+- `make -C fpga bitstream_tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `fpga/vivado/ultra96v2/vi_tile/`.
+- `make -C fpga bitstream_stream` — HLS + Vivado synthesis + bitstream for streaming kernel, project `fpga/vivado/ultra96v2/vi_stream/`.
 - After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header` (copies `xvi_sweep_hw.h` into `driver/uio/generated/`; review the diff).
 
 ## Architecture

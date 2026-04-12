@@ -21,7 +21,11 @@ petalinux/project/
 petalinux/docker/*.run
 
 # Vivado project artifacts
+fpga/vivado/ultra96v2/vi_tile/
+fpga/vivado/ultra96v2/vi_stream/
 fpga/vivado/ultra96v2/vi_ultra96v2/
+fpga/vivado/ultra96v2/ip_repo_tile/
+fpga/vivado/ultra96v2/ip_repo_stream/
 fpga/vivado/ultra96v2/ip_repo/
 
 # C build artifacts
