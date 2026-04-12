@@ -2,50 +2,48 @@ FPGA_DIR    := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 SCRIPTS_DIR := $(FPGA_DIR)scripts/
 VIVADO_DIR  := $(FPGA_DIR)vivado/ultra96v2/
 
-.PHONY: csim_tile hls_tile vivado_tile bitstream_tile \
-        csim_stream hls_stream vivado_stream bitstream_stream \
-        clean_hls_tile clean_hls_stream clean_vivado_tile clean_vivado_stream clean
+# ---------- Kernel selector ----------
+# Usage: make -C fpga csim stream
+#        make -C fpga bitstream tile
 
-# ---------- Tile-based kernel ----------
+ifneq ($(filter stream,$(MAKECMDGOALS)),)
+  KERNEL := stream
+endif
+ifneq ($(filter tile,$(MAKECMDGOALS)),)
+  KERNEL := tile
+endif
 
-csim_tile:
-	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl run_csim_tile.tcl
+stream tile:
+	@:
 
-hls_tile:
-	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl export_hls_ip_tile.tcl
-	cd $(VIVADO_DIR)ip_repo_tile && unzip -o export.zip
+.PHONY: stream tile csim hls vivado bitstream clean_hls clean_vivado clean
 
-vivado_tile: hls_tile
-	vivado -mode batch -source $(SCRIPTS_DIR)build_vivado.tcl -tclargs tile
+# ---------- Build targets ----------
 
-bitstream_tile: vivado_tile
+csim:
+	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl run_csim_$(KERNEL).tcl
 
-# ---------- Streaming kernel ----------
+hls:
+	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl export_hls_ip_$(KERNEL).tcl
+	cd $(VIVADO_DIR)ip_repo_$(KERNEL) && unzip -o export.zip
 
-csim_stream:
-	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl run_csim_stream.tcl
+vivado: hls
+	vivado -mode batch -source $(SCRIPTS_DIR)build_vivado.tcl -tclargs $(KERNEL)
 
-hls_stream:
-	cd $(SCRIPTS_DIR) && vitis-run --mode hls --tcl export_hls_ip_stream.tcl
-	cd $(VIVADO_DIR)ip_repo_stream && unzip -o export.zip
-
-vivado_stream: hls_stream
-	vivado -mode batch -source $(SCRIPTS_DIR)build_vivado.tcl -tclargs stream
-
-bitstream_stream: vivado_stream
+bitstream: vivado
 
 # ---------- Clean ----------
 
-clean_hls_tile:
-	if exist "$(subst /,\,$(SCRIPTS_DIR)hls_build_tile)" rmdir /s /q "$(subst /,\,$(SCRIPTS_DIR)hls_build_tile)"
+clean_hls:
+	if exist "$(subst /,\,$(SCRIPTS_DIR)hls_build_$(KERNEL))" rmdir /s /q "$(subst /,\,$(SCRIPTS_DIR)hls_build_$(KERNEL))"
 
-clean_hls_stream:
-	if exist "$(subst /,\,$(SCRIPTS_DIR)hls_build_stream)" rmdir /s /q "$(subst /,\,$(SCRIPTS_DIR)hls_build_stream)"
+clean_vivado:
+	if exist "$(subst /,\,$(VIVADO_DIR)vi_$(KERNEL))" rmdir /s /q "$(subst /,\,$(VIVADO_DIR)vi_$(KERNEL))"
 
-clean_vivado_tile:
-	if exist "$(subst /,\,$(VIVADO_DIR)vi_tile)" rmdir /s /q "$(subst /,\,$(VIVADO_DIR)vi_tile)"
-
-clean_vivado_stream:
-	if exist "$(subst /,\,$(VIVADO_DIR)vi_stream)" rmdir /s /q "$(subst /,\,$(VIVADO_DIR)vi_stream)"
-
-clean: clean_hls_tile clean_hls_stream clean_vivado_tile clean_vivado_stream
+ifdef KERNEL
+clean: clean_hls clean_vivado
+else
+clean:
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean_hls clean_vivado stream
+	$(MAKE) -f $(lastword $(MAKEFILE_LIST)) clean_hls clean_vivado tile
+endif

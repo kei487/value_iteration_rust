@@ -21,12 +21,13 @@ Top-level `Makefile` delegates to `driver/uio/` and `host/`. Run from the repo r
 
 Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). Do **not** prefix with `source settings.sh`. Tile and streaming kernels have fully separate build paths.
 
-- `make -C fpga csim_tile` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
-- `make -C fpga csim_stream` — HLS C-simulation of streaming kernel (`fpga/hls/vi_sweep_stream/`).
-- `make -C fpga hls_tile` — HLS synth + IP export (tile) into `fpga/scripts/hls_build_tile/`, IP to `ip_repo_tile/`.
-- `make -C fpga hls_stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`, IP to `ip_repo_stream/`.
-- `make -C fpga bitstream_tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `fpga/vivado/ultra96v2/vi_tile/`.
-- `make -C fpga bitstream_stream` — HLS + Vivado synthesis + bitstream for streaming kernel, project `fpga/vivado/ultra96v2/vi_stream/`.
+- `make -C fpga csim tile` — HLS C-simulation of tile-based kernel (`fpga/hls/vi_sweep_tile/`).
+- `make -C fpga csim stream` — HLS C-simulation of streaming kernel (`fpga/hls/vi_sweep_stream/`).
+- `make -C fpga hls tile` — HLS synth + IP export (tile) into `fpga/scripts/hls_build_tile/`, IP to `ip_repo_tile/`.
+- `make -C fpga hls stream` — HLS synth + IP export (streaming) into `fpga/scripts/hls_build_stream/`, IP to `ip_repo_stream/`.
+- `make -C fpga bitstream tile` — HLS + Vivado synthesis + bitstream for tile kernel, project `fpga/vivado/ultra96v2/vi_tile/`.
+- `make -C fpga bitstream stream` — HLS + Vivado synthesis + bitstream for streaming kernel, project `fpga/vivado/ultra96v2/vi_stream/`.
+- `make -C fpga clean` — clean both tile and stream build artifacts. Append `tile` or `stream` to clean one.
 - After regenerating HLS IP, sync the register header into the driver: `make -C driver/uio sync-hw-header` (copies `xvi_sweep_hw.h` into `driver/uio/generated/`; review the diff).
 
 ## Architecture
