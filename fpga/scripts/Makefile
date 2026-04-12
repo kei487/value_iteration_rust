@@ -6,11 +6,11 @@ all: bitstream
 
 # C-simulation (testbench)
 csim:
-	cd $(SCRIPTS_DIR) && vitis_hls -f run_csim.tcl
+	cd $(SCRIPTS_DIR) && vitis_hls -f run_csim_tile.tcl
 
 # HLS synthesis + IP export
 hls:
-	cd $(SCRIPTS_DIR) && vitis_hls -f export_hls_ip.tcl
+	cd $(SCRIPTS_DIR) && vitis_hls -f export_hls_ip_tile.tcl
 
 # Vivado project creation + synthesis + bitstream
 vivado: hls
