@@ -8,9 +8,14 @@ fpga/hls/vi_sweep_tile/.Xil/
 fpga/hls/vi_sweep_stream/hls_build*/
 fpga/hls/vi_sweep_stream/solution*/
 fpga/hls/vi_sweep_stream/.Xil/
+fpga/scripts/.hls.failed
 dfx_runtime.txt
 
-# PetaLinux build artifacts
+# EDF / PetaLinux build artifacts
+edf/
+petalinux/edf/
+petalinux/sstate-cache/
+petalinux/downloads/
 petalinux/output/
 petalinux/project/
 petalinux/docker/*.run
