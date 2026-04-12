@@ -1,50 +1,44 @@
 #!/bin/bash
-# Build PetaLinux project and package BOOT.BIN.
+# Build AMD EDF Linux image for Ultra96-V2.
 # Run inside the Docker container with the repo mounted at /work.
 #
-# Usage: build.sh [--bitstream <path-to-bit>]
+# Usage: build.sh [--machine <name>] [--image <recipe>]
 set -euo pipefail
 
-PROJECT_DIR="/work/petalinux/project/vi_petalinux"
-OUTPUT_DIR="/work/petalinux/output"
-BITSTREAM=""
+MACHINE="${MACHINE:-ultra96v2-vi}"
+IMAGE="edf-linux-disk-image"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --bitstream) BITSTREAM="$2"; shift 2 ;;
+        --machine) MACHINE="$2"; shift 2 ;;
+        --image)   IMAGE="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-if [ ! -d "${PROJECT_DIR}" ]; then
-    echo "ERROR: Project not found at ${PROJECT_DIR}. Run create_project.sh first."
+EDF_DIR="/work/edf"
+OUTPUT_DIR="/work/petalinux/output"
+
+if [ ! -f "${EDF_DIR}/build/conf/local.conf" ]; then
+    echo "ERROR: EDF not set up. Run setup.sh first."
     exit 1
 fi
 
-cd "${PROJECT_DIR}"
+cd "${EDF_DIR}"
+source edf-init-build-env build
 
-echo "==> Building PetaLinux project..."
-petalinux-build
+echo "==> Building: MACHINE=${MACHINE} bitbake ${IMAGE}"
+MACHINE="${MACHINE}" bitbake "${IMAGE}"
 
-echo "==> Packaging BOOT.BIN..."
-BOOT_ARGS=(
-    --boot
-    --fsbl images/linux/zynqmp_fsbl.elf
-    --u-boot images/linux/u-boot.elf
-    --pmufw images/linux/pmufw.elf
-    --force
-)
-if [ -n "${BITSTREAM}" ]; then
-    BOOT_ARGS+=(--fpga "${BITSTREAM}")
-fi
-petalinux-package "${BOOT_ARGS[@]}"
-
+# Copy key artifacts
 echo "==> Copying artifacts to ${OUTPUT_DIR}..."
 mkdir -p "${OUTPUT_DIR}"
-cp images/linux/BOOT.BIN    "${OUTPUT_DIR}/"
-cp images/linux/image.ub    "${OUTPUT_DIR}/"
-cp images/linux/boot.scr    "${OUTPUT_DIR}/"
-cp images/linux/rootfs.tar.gz "${OUTPUT_DIR}/" 2>/dev/null || true
+DEPLOY="${EDF_DIR}/build/tmp/deploy/images/${MACHINE}"
+
+for f in "${DEPLOY}"/*.wic.gz "${DEPLOY}"/BOOT.BIN "${DEPLOY}"/image.ub \
+         "${DEPLOY}"/boot.scr "${DEPLOY}"/*.dtb; do
+    [ -f "$f" ] && cp "$f" "${OUTPUT_DIR}/" && echo "  $(basename "$f")"
+done
 
 echo "==> Done. Artifacts in ${OUTPUT_DIR}/"
 ls -lh "${OUTPUT_DIR}/"

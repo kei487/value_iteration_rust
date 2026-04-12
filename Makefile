@@ -1,7 +1,7 @@
 .PHONY: driver host test-host test-hw \
        csim hls vivado bitstream sync-hw-header \
-       plnx-docker plnx-shell plnx-create plnx-build plnx-package \
-       clean clean-fpga clean-plnx
+       edf-docker edf-shell edf-setup edf-build \
+       clean clean-fpga clean-edf
 
 # ---------- Software (driver + host) ----------
 
@@ -33,26 +33,23 @@ bitstream: vivado
 sync-hw-header: hls
 	$(MAKE) -C driver/uio sync-hw-header
 
-# ---------- PetaLinux (Docker) ----------
+# ---------- EDF / Linux (Docker) ----------
 
-plnx-docker:
+edf-docker:
 	$(MAKE) -C petalinux docker-build
 
-plnx-shell:
+edf-shell:
 	$(MAKE) -C petalinux docker-shell
 
-plnx-create:
-	$(MAKE) -C petalinux plnx-create XSA=$(XSA)
+edf-setup:
+	$(MAKE) -C petalinux edf-setup XSA=$(XSA)
 
-plnx-build:
-	$(MAKE) -C petalinux plnx-build
-
-plnx-package:
-	$(MAKE) -C petalinux plnx-package BITSTREAM=$(BITSTREAM)
+edf-build:
+	$(MAKE) -C petalinux edf-build MACHINE=$(MACHINE)
 
 # ---------- Clean ----------
 
-clean-plnx:
+clean-edf:
 	$(MAKE) -C petalinux clean
 
 clean-fpga:

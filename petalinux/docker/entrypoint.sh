@@ -1,9 +1,16 @@
 #!/bin/bash
-# Source PetaLinux settings and execute the given command
+# EDF container entrypoint
+# Sources the Yocto build environment if it exists, then exec's the command.
 set -e
 
-if [ -f "${PETALINUX}/settings.sh" ]; then
-    source "${PETALINUX}/settings.sh"
+SAVED_ARGS=("$@")
+set --
+
+# Source EDF build env if setup has been run
+if [ -f /work/edf/build/conf/local.conf ]; then
+    cd /work/edf
+    source edf-init-build-env build 2>/dev/null || true
 fi
 
-exec "$@"
+cd /work
+exec "${SAVED_ARGS[@]}"

@@ -1,45 +1,37 @@
 REPO_ROOT   := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
-IMAGE_NAME  := vi-petalinux:2025.2
-CONTAINER   := vi-petalinux-builder
-PROJECT_DIR := project/vi_petalinux
+IMAGE_NAME  := vi-edf:2025.2
 
-# PetaLinux installer filename (place in docker/ before building)
-PETALINUX_INSTALLER ?= petalinux-v2025.2-11160223-installer.run
-
-# Path to .xsa (set when running create target)
+# Path to .xsa (for machine config generation)
 XSA ?=
 
-# Path to .bit (optional, for BOOT.BIN packaging)
-BITSTREAM ?=
+# Machine name (default: custom Ultra96-V2 config)
+MACHINE ?= ultra96v2-vi
 
-.PHONY: docker-build docker-shell plnx-create plnx-build plnx-package clean help
+# Yocto image recipe
+IMAGE ?= edf-linux-disk-image
+
+.PHONY: docker-build docker-shell edf-setup edf-build clean help
 
 help:
-	@echo "PetaLinux Docker build targets:"
+	@echo "AMD EDF (Yocto) build targets for Ultra96-V2:"
 	@echo ""
-	@echo "  make docker-build                          Build Docker image"
-	@echo "  make docker-shell                          Interactive shell in container"
-	@echo "  make plnx-create XSA=<path/to/design.xsa>  Create & configure project"
-	@echo "  make plnx-build                            Build Linux images"
-	@echo "  make plnx-package BITSTREAM=<path/to/file.bit>  Package BOOT.BIN with bitstream"
-	@echo "  make clean                                 Remove project and output dirs"
+	@echo "  make docker-build                    Build Docker image (no installer needed)"
+	@echo "  make docker-shell                    Interactive shell in container"
+	@echo "  make edf-setup                       repo init + sync EDF layers (first time)"
+	@echo "  make edf-setup XSA=<path>            Setup + generate machine config from XSA"
+	@echo "  make edf-build                       Build Linux image (WIC + BOOT.BIN)"
+	@echo "  make edf-build MACHINE=<name>        Build for specific machine"
+	@echo "  make clean                           Remove project and output dirs"
 	@echo ""
-	@echo "Prerequisites:"
-	@echo "  1. Download petalinux-v2025.2-*-installer.run from AMD"
-	@echo "  2. Place it in petalinux/docker/"
-	@echo "  3. Run: make docker-build"
+	@echo "First-time workflow:"
+	@echo "  1. make docker-build"
+	@echo "  2. make edf-setup XSA=path/to/design.xsa"
+	@echo "  3. make edf-build"
 
 # ---------- Docker image ----------
 
 docker-build:
-	@if [ ! -f docker/$(PETALINUX_INSTALLER) ]; then \
-		echo "ERROR: docker/$(PETALINUX_INSTALLER) not found."; \
-		echo "Download it from https://www.xilinx.com/support/download.html"; \
-		exit 1; \
-	fi
-	docker build -t $(IMAGE_NAME) \
-		--build-arg PETALINUX_INSTALLER=$(PETALINUX_INSTALLER) \
-		docker/
+	docker build -t $(IMAGE_NAME) docker/
 
 # ---------- Run helpers ----------
 
@@ -53,30 +45,17 @@ endef
 docker-shell:
 	$(DOCKER_RUN) bash
 
-# ---------- PetaLinux workflow ----------
+# ---------- EDF workflow ----------
 
-plnx-create:
-	@if [ -z "$(XSA)" ]; then \
-		echo "ERROR: XSA not set. Usage: make plnx-create XSA=path/to/design.xsa"; \
-		exit 1; \
-	fi
-	$(DOCKER_RUN) bash /work/petalinux/scripts/create_project.sh "$(XSA)"
+edf-setup:
+	$(DOCKER_RUN) bash /work/petalinux/scripts/setup.sh \
+		$(if $(XSA),--xsa "$(XSA)")
 
-plnx-build:
-	@if [ ! -d "$(PROJECT_DIR)" ]; then \
-		echo "ERROR: Project not found. Run 'make plnx-create XSA=...' first."; \
-		exit 1; \
-	fi
-	$(DOCKER_RUN) bash /work/petalinux/scripts/build.sh
-
-plnx-package:
-	@if [ -z "$(BITSTREAM)" ]; then \
-		echo "ERROR: BITSTREAM not set. Usage: make plnx-package BITSTREAM=path/to/file.bit"; \
-		exit 1; \
-	fi
-	$(DOCKER_RUN) bash /work/petalinux/scripts/build.sh --bitstream "$(BITSTREAM)"
+edf-build:
+	$(DOCKER_RUN) bash /work/petalinux/scripts/build.sh \
+		--machine "$(MACHINE)" --image "$(IMAGE)"
 
 # ---------- Clean ----------
 
 clean:
-	rm -rf project/ output/
+	rm -rf edf/ sstate-cache/ downloads/ output/

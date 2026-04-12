@@ -1,68 +1,48 @@
-# PetaLinux 2025.2 build environment
+# AMD EDF (Embedded Development Framework) 2025.2 build environment
+# Yocto-based successor to PetaLinux — no monolithic installer needed.
+#
 # Usage:
-#   1. Download petalinux-v2025.2-*-installer.run from AMD
-#   2. Place it in petalinux/docker/ (or set PETALINUX_INSTALLER at build time)
-#   3. make -C petalinux docker-build
-FROM ubuntu:22.04 AS base
+#   make -C petalinux docker-build
+#   make -C petalinux edf-setup   # repo init + sync (first time)
+#   make -C petalinux edf-build   # bitbake
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Tokyo
 
-# PetaLinux 2025.2 dependencies (UG1144 Table 2)
+# Yocto Project host dependencies (Yocto 5.x / Scarthgap)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    autoconf automake bc bison build-essential ca-certificates chrpath \
-    cpio curl debianutils diffstat expect flex gawk gcc-multilib \
-    git gnupg gzip iproute2 iputils-ping kmod libegl1-mesa \
-    libglib2.0-dev libncurses5-dev libsdl1.2-dev libssl-dev libtinfo5 \
-    libtool lz4 locales lsb-release make net-tools pax python3 \
-    python3-distutils python3-gi python3-jinja2 python3-pexpect \
-    python3-pip python3-subunit rsync screen socat sudo texinfo \
-    tftpd-hpa u-boot-tools unzip wget xterm xz-utils zstd \
+    build-essential ca-certificates chrpath cpio curl debianutils diffstat \
+    file gawk gcc git iputils-ping less libacl1 liblz4-tool locales lz4 make \
+    python3 python3-git python3-jinja2 python3-pexpect python3-pip \
+    python3-subunit socat sudo texinfo unzip wget xz-utils zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# Locale (required by PetaLinux)
+# Locale (required by bitbake)
 RUN locale-gen en_US.UTF-8
 ENV LANG=en_US.UTF-8
 
-# Non-root user (PetaLinux refuses to run as root)
-ARG PUSER=plnx
+# Non-root user (bitbake refuses to run as root)
+ARG PUSER=yocto
 ARG PUID=1000
 RUN useradd -m -u ${PUID} -s /bin/bash ${PUSER} \
-    && echo "${PUSER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    && echo "${PUSER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
+    && ln -sf /bin/bash /bin/sh
 
-# ---------- PetaLinux installer ----------
-FROM base AS install
-
-ARG PETALINUX_INSTALLER=petalinux-v2025.2-final-installer.run
-COPY ${PETALINUX_INSTALLER} /tmp/installer.run
-
-ARG PETALINUX_DIR=/opt/petalinux/2025.2
-RUN chmod +x /tmp/installer.run \
-    && mkdir -p ${PETALINUX_DIR} \
-    && chown ${PUSER}:${PUSER} ${PETALINUX_DIR}
-
-USER ${PUSER}
-RUN /tmp/installer.run --skip_license --dir ${PETALINUX_DIR}
-
-USER root
-RUN rm /tmp/installer.run
-
-# ---------- Final image ----------
-FROM base AS final
-
-ARG PUSER=plnx
-ARG PETALINUX_DIR=/opt/petalinux/2025.2
-
-COPY --from=install ${PETALINUX_DIR} ${PETALINUX_DIR}
-RUN chown -R ${PUSER}:${PUSER} ${PETALINUX_DIR}
-
-ENV PETALINUX=${PETALINUX_DIR}
+# Install Google repo tool
+RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
+    > /usr/local/bin/repo && chmod +x /usr/local/bin/repo
 
 # Workspace mount point
 RUN mkdir -p /work && chown ${PUSER}:${PUSER} /work
 WORKDIR /work
 
 USER ${PUSER}
+
+# Git config (required by repo tool)
+RUN git config --global user.email "builder@vi-sweep" \
+    && git config --global user.name "VI Builder" \
+    && git config --global color.ui false
 
 COPY --chown=${PUSER}:${PUSER} entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
