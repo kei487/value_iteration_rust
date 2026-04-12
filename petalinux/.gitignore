@@ -1,0 +1,8 @@
+# PetaLinux project (huge, generated)
+project/
+
+# Build output artifacts
+output/
+
+# PetaLinux installer (3+ GB, not checked in)
+docker/*.run

@@ -1,10 +1,19 @@
 # HLS build artifacts
 fpga/scripts/hls_build/
+fpga/scripts/hls_build_stream/
 fpga/hls/vi_sweep/hls_build/
 fpga/hls/vi_sweep/solution*/
 fpga/hls/vi_sweep/dfx_runtime.txt
 fpga/hls/vi_sweep/.Xil/
+fpga/hls/vi_sweep_stream/hls_build*/
+fpga/hls/vi_sweep_stream/solution*/
+fpga/hls/vi_sweep_stream/.Xil/
 dfx_runtime.txt
+
+# PetaLinux build artifacts
+petalinux/output/
+petalinux/project/
+petalinux/docker/*.run
 
 # Bitstream artifacts (large binary files)
 fpga/pynq/*.bit
