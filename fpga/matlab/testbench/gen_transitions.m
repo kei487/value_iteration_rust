@@ -39,13 +39,13 @@ function trans = gen_transitions(mode)
             trans((0)*p.N_THETA + it) = pack_trans(dix_fwd, diy_fwd, 0);
             % Action 1: backward
             trans((1)*p.N_THETA + it) = pack_trans(dix_bwd, diy_bwd, 0);
-            % Action 2: turn left (rotate +dt_turn)
-            trans((2)*p.N_THETA + it) = pack_trans(dix_fwd, diy_fwd, dt_turn);
-            % Action 3: turn right (rotate -dt_turn)
-            trans((3)*p.N_THETA + it) = pack_trans(dix_fwd, diy_fwd, -dt_turn);
-            % Action 4: forward-left
+            % Action 2: turn left — pure rotation, no spatial displacement
+            trans((2)*p.N_THETA + it) = pack_trans(0, 0, dt_turn);
+            % Action 3: turn right — pure rotation, no spatial displacement
+            trans((3)*p.N_THETA + it) = pack_trans(0, 0, -dt_turn);
+            % Action 4: forward-left (spatial move + theta change)
             trans((4)*p.N_THETA + it) = pack_trans(dix_fwd, diy_fwd, dt_turn);
-            % Action 5: forward-right
+            % Action 5: forward-right (spatial move + theta change)
             trans((5)*p.N_THETA + it) = pack_trans(dix_fwd, diy_fwd, -dt_turn);
         end
     else

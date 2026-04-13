@@ -39,13 +39,19 @@ function tb_full_sweep()
         end
 
         % Compare converged values: both should converge to same result.
-        % The C reference uses a different sweep order (raster scan),
-        % so we compare only convergence, not intermediate values.
-        % Check that MATLAB result has same reachability pattern.
+        % After full convergence, reachable cells must have identical
+        % optimal cost values between MATLAB and C reference.
         ml_reachable = (ml_value < MV);
         ref_reachable = (ref_out < MV);
         assert(isequal(ml_reachable, ref_reachable), ...
             [t.name ': reachability mismatch']);
+
+        % Verify actual converged values match (not just reachability)
+        reachable_mask = ref_reachable;
+        ml_vals = ml_value(reachable_mask);
+        ref_vals = ref_out(reachable_mask);
+        assert(isequal(ml_vals, ref_vals), ...
+            [t.name ': value mismatch on reachable cells']);
 
         % Goal cells must be 0 in both
         goal_mask = (penalty == double(p.PENALTY_GOAL));
