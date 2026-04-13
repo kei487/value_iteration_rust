@@ -12,6 +12,11 @@ apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e \
 
 # Enable HP0 + HP1 for data, disable unused HPM1
 set_property -dict [list \
+    CONFIG.PSU__USE__CLK0 {1} \
+    CONFIG.PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ {150.000000} \
+    CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {150} \
+    CONFIG.PSU__CRL_APB__PL0_REF_CTRL__DIVISOR0 {10} \
+    CONFIG.PSU__CRL_APB__PL0_REF_CTRL__DIVISOR1 {1} \
     CONFIG.PSU__USE__S_AXI_GP2 {1} \
     CONFIG.PSU__SAXIGP2__DATA_WIDTH {128} \
     CONFIG.PSU__USE__S_AXI_GP3 {1} \

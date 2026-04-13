@@ -15,6 +15,25 @@ if {$variant ni {tile stream}} {
 set script_dir   [file normalize [file dirname [info script]]]
 set project_name "vi_${variant}"
 set xpr_file     "$build_dir/$project_name/$project_name.xpr"
+set run_jobs 2
+
+if {[info exists ::env(VI_VIVADO_JOBS)] && $::env(VI_VIVADO_JOBS) ne ""} {
+    set run_jobs $::env(VI_VIVADO_JOBS)
+}
+
+proc ensure_run_is_launchable {run_name} {
+    set run [get_runs $run_name -quiet]
+    if {[llength $run] == 0} {
+        return
+    }
+
+    set status [get_property STATUS $run]
+    set needs_refresh [get_property NEEDS_REFRESH $run]
+    if {$needs_refresh || ![string match "Not started*" $status]} {
+        puts "INFO: Resetting $run_name (STATUS='$status', NEEDS_REFRESH=$needs_refresh)"
+        reset_run $run_name
+    }
+}
 
 if {![file exists $xpr_file]} {
     puts "INFO: Project not found, creating..."
@@ -31,27 +50,23 @@ if {[llength $locked] > 0} {
     upgrade_ip $locked
 }
 
-# Reset stale runs so they can be re-launched
-if {[get_property NEEDS_REFRESH [get_runs synth_1]]} {
-    puts "INFO: Resetting synth_1 (stale)"
-    reset_run synth_1
-}
+# Reset runs so they can always be re-launched after HLS/IP regeneration
+ensure_run_is_launchable synth_1
 
 # Synthesis (incremental — skips unchanged OOC blocks)
-launch_runs synth_1 -jobs 6
+puts "INFO: Launching synth_1 with -jobs $run_jobs"
+launch_runs synth_1 -jobs $run_jobs
 wait_on_run synth_1
 if {[get_property STATUS [get_runs synth_1]] != "synth_design Complete!"} {
     error "Synthesis failed"
 }
 
-# Reset impl run if stale
-if {[get_property NEEDS_REFRESH [get_runs impl_1]]} {
-    puts "INFO: Resetting impl_1 (stale)"
-    reset_run impl_1
-}
+# Reset implementation run before re-launch
+ensure_run_is_launchable impl_1
 
 # Implementation + bitstream
-launch_runs impl_1 -to_step write_bitstream -jobs 6
+puts "INFO: Launching impl_1 with -jobs $run_jobs"
+launch_runs impl_1 -to_step write_bitstream -jobs $run_jobs
 wait_on_run impl_1
 if {[get_property STATUS [get_runs impl_1]] != "write_bitstream Complete!"} {
     error "Implementation/bitstream failed"

@@ -25,7 +25,21 @@ void compute_row(
     value_t local_max = 0;
 
     int ny_lut[N_ACTIONS][N_THETA];
+    value_t center_old[N_THETA];
+    value_t fw_cost_cache[N_THETA];
+    value_t bw_cost_cache[N_THETA];
+    value_t fl_cost_cache[N_THETA];
+    value_t fr_cost_cache[N_THETA];
+    value_t prev_rot_cost[3];
+    value_t first_rot_new[3];
     #pragma HLS ARRAY_PARTITION variable=ny_lut complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=center_old complete
+    #pragma HLS ARRAY_PARTITION variable=fw_cost_cache complete
+    #pragma HLS ARRAY_PARTITION variable=bw_cost_cache complete
+    #pragma HLS ARRAY_PARTITION variable=fl_cost_cache complete
+    #pragma HLS ARRAY_PARTITION variable=fr_cost_cache complete
+    #pragma HLS ARRAY_PARTITION variable=prev_rot_cost complete
+    #pragma HLS ARRAY_PARTITION variable=first_rot_new complete
 
     int y_sign = (cu_id == 0) ? 1 : -1;
     PRECOMP_NY: for (int a = 0; a < N_ACTIONS; a++) {
@@ -48,63 +62,91 @@ void compute_row(
         int bx = ix + HALO_MAX;
 
         penalty_t cell_pen = pen_buf_0[win_center][bx];
+        penalty_t rot_pen = pen_buf_1[win_center][bx];
         bool skip = (!x_active) || (cell_pen >= PENALTY_GOAL);
 
-        LOOP_T: for (int it = 0; it < N_THETA; it++) {
+        LOAD_CENTER: for (int it = 0; it < N_THETA; it++) {
             #pragma HLS PIPELINE II=1
-            #pragma HLS DEPENDENCE variable=val_buf type=inter false
 
-            value_t old_val = val_buf[win_center][bx][it];
+            center_old[it] = val_buf[win_center][bx][it];
+        }
+
+        PREFETCH_FW_BW: for (int it = 0; it < N_THETA; it++) {
+            #pragma HLS PIPELINE II=1
+
+            int nx0 = bx + (int)delta_table[0][it][0];
+            fw_cost_cache[it] = cost_of(val_buf[ny_lut[0][it]][nx0][it],
+                                        pen_buf_0[ny_lut[0][it]][nx0]);
+
+            int nx1 = bx + (int)delta_table[1][it][0];
+            bw_cost_cache[it] = cost_of(val_buf[ny_lut[1][it]][nx1][it],
+                                        pen_buf_0[ny_lut[1][it]][nx1]);
+        }
+
+        PREFETCH_DIAG: for (int it = 0; it < N_THETA; it++) {
+            #pragma HLS PIPELINE II=1
 
             int it_l = it + 3;
             if (it_l >= N_THETA) it_l -= N_THETA;
             int it_r = it - 3;
             if (it_r < 0) it_r += N_THETA;
 
-            // Action 0: forward  (bank[it])
-            int nx0 = bx + (int)delta_table[0][it][0];
-            value_t c0 = cost_of(val_buf[ny_lut[0][it]][nx0][it],
-                                 pen_buf_0[ny_lut[0][it]][nx0]);
-
-            // Action 1: backward (bank[it])
-            int nx1 = bx + (int)delta_table[1][it][0];
-            value_t c1 = cost_of(val_buf[ny_lut[1][it]][nx1][it],
-                                 pen_buf_0[ny_lut[1][it]][nx1]);
-
-            // Action 2: left     (bank[it_l])
-            int nx2 = bx + (int)delta_table[2][it][0];
-            value_t c2 = cost_of(val_buf[ny_lut[2][it]][nx2][it_l],
-                                 pen_buf_1[ny_lut[2][it]][nx2]);
-
-            // Action 3: right    (bank[it_r])
-            int nx3 = bx + (int)delta_table[3][it][0];
-            value_t c3 = cost_of(val_buf[ny_lut[3][it]][nx3][it_r],
-                                 pen_buf_1[ny_lut[3][it]][nx3]);
-
-            // Action 4: fwd-left (bank[it_l])
             int nx4 = bx + (int)delta_table[4][it][0];
-            value_t c4 = cost_of(val_buf[ny_lut[4][it]][nx4][it_l],
-                                 pen_buf_2[ny_lut[4][it]][nx4]);
+            fl_cost_cache[it] = cost_of(val_buf[ny_lut[4][it]][nx4][it_l],
+                                        pen_buf_2[ny_lut[4][it]][nx4]);
 
-            // Action 5: fwd-right(bank[it_r])
             int nx5 = bx + (int)delta_table[5][it][0];
-            value_t c5 = cost_of(val_buf[ny_lut[5][it]][nx5][it_r],
-                                 pen_buf_2[ny_lut[5][it]][nx5]);
+            fr_cost_cache[it] = cost_of(val_buf[ny_lut[5][it]][nx5][it_r],
+                                        pen_buf_2[ny_lut[5][it]][nx5]);
+        }
 
-            // Min-reduction tree
-            value_t min01 = (c0 < c1) ? c0 : c1;
-            value_t min23 = (c2 < c3) ? c2 : c3;
-            value_t min45 = (c4 < c5) ? c4 : c5;
-            value_t min03 = (min01 < min23) ? min01 : min23;
-            value_t min_cost = (min03 < min45) ? min03 : min45;
+        INIT_ROT_CHAIN: for (int lane = 0; lane < 3; lane++) {
+            #pragma HLS UNROLL
+            prev_rot_cost[lane] = center_old[N_THETA - 3 + lane];
+            first_rot_new[lane] = center_old[lane];
+        }
 
-            value_t new_val = skip ? old_val : min_cost;
-            val_buf[win_center][bx][it] = new_val;
+        // theta indices form 3 independent circular chains: 0,3,6..., 1,4,7..., 2,5,8...
+        LOOP_T_STEP: for (int step = 0; step < N_THETA / 3; step++) {
+            #pragma HLS PIPELINE II=1
 
-            value_t d = (new_val > old_val) ? (value_t)(new_val - old_val)
-                                            : (value_t)(old_val - new_val);
-            value_t masked_d = skip ? (value_t)0 : d;
-            if (masked_d > local_max) local_max = masked_d;
+            int base_it = 3 * step;
+
+            LOOP_T_LANE: for (int lane = 0; lane < 3; lane++) {
+                #pragma HLS UNROLL
+
+                int it = base_it + lane;
+                value_t old_val = center_old[it];
+
+                value_t rot_left_src =
+                    (step == (N_THETA / 3 - 1)) ? first_rot_new[lane]
+                                                : center_old[it + 3];
+                value_t rot_right_src = prev_rot_cost[lane];
+
+                value_t c0 = fw_cost_cache[it];
+                value_t c1 = bw_cost_cache[it];
+                value_t c2 = cost_of(rot_left_src, rot_pen);
+                value_t c3 = cost_of(rot_right_src, rot_pen);
+                value_t c4 = fl_cost_cache[it];
+                value_t c5 = fr_cost_cache[it];
+
+                value_t min01 = (c0 < c1) ? c0 : c1;
+                value_t min23 = (c2 < c3) ? c2 : c3;
+                value_t min45 = (c4 < c5) ? c4 : c5;
+                value_t min03 = (min01 < min23) ? min01 : min23;
+                value_t min_cost = (min03 < min45) ? min03 : min45;
+
+                value_t new_val = skip ? old_val : min_cost;
+                val_buf[win_center][bx][it] = new_val;
+
+                prev_rot_cost[lane] = new_val;
+                if (step == 0) first_rot_new[lane] = new_val;
+
+                value_t d = (new_val > old_val) ? (value_t)(new_val - old_val)
+                                                : (value_t)(old_val - new_val);
+                value_t masked_d = skip ? (value_t)0 : d;
+                if (masked_d > local_max) local_max = masked_d;
+            }
         }
     }
 
