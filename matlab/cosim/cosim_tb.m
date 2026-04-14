@@ -2,12 +2,12 @@ function cosim_tb()
 %COSIM_TB HDL Verifier cosimulation testbench.
 %   Runs generated HDL through Xsim and compares against MATLAB golden output.
 %   Prerequisites:
-%     1. Phase A (float) tests pass (tb_full_sweep)
+%     1. Phase A (float) tests pass (run_matlab_tests)
 %     2. Fixed-point conversion applied
 %     3. HDL generated via hdlcoder.WorkflowAdvisor
 
     addpath(fullfile(fileparts(mfilename('fullpath')), '..', 'src'));
-    addpath(fullfile(fileparts(mfilename('fullpath')), '..', 'testbench'));
+    addpath(fullfile(fileparts(mfilename('fullpath')), '..', 'test'));
 
     cfg = cosim_config();
 

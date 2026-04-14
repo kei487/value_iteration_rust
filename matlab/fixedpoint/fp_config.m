@@ -4,7 +4,7 @@ function fp_config()
 %   Uses tb_full_sweep test data to analyze dynamic range.
 
     addpath(fullfile(fileparts(mfilename('fullpath')), '..', 'src'));
-    addpath(fullfile(fileparts(mfilename('fullpath')), '..', 'testbench'));
+    addpath(fullfile(fileparts(mfilename('fullpath')), '..', 'test'));
     p = vi_params();
 
     % --- Define fixed-point type proposals ---

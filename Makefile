@@ -58,7 +58,7 @@ edf-build:
 .PHONY: matlab-sim matlab-hdl matlab-cosim matlab-bitstream
 
 matlab-sim:
-	cd matlab && matlab -batch "addpath('src','testbench'); tb_full_sweep"
+	cd matlab && matlab -batch "run_matlab_tests"
 
 matlab-hdl:
 	cd matlab && matlab -batch "addpath('src','model'); cd model; create_model"

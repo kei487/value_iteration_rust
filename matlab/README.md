@@ -16,25 +16,16 @@ MATLAB HDL Coder + SoC Blockset.
 ## Quick Start
 
 ```matlab
-% 1. Add paths
-addpath('src', 'testbench');
+% 1. Run the matlab.unittest suite (no toolboxes needed beyond base MATLAB)
+run_matlab_tests
 
-% 2. Run unit tests (no toolboxes needed beyond base MATLAB)
-tb_cost_of
-tb_compute_row
-tb_load_store_row
-tb_stream_strip
-tb_full_sweep
-tb_goal_area
-tb_paper_vs_fpga       % Reports paper-vs-FPGA mismatch percentages
-
-% 3. Fixed-point analysis (requires Fixed-Point Designer)
+% 2. Fixed-point analysis (requires Fixed-Point Designer)
 cd fixedpoint; fp_config
 
-% 4. HDL cosimulation (requires HDL Verifier + Vivado Xsim)
+% 3. HDL cosimulation (requires HDL Verifier + Vivado Xsim)
 cd cosim; cosim_tb
 
-% 5. Bitstream generation (requires HDL Coder + SoC Blockset + Vivado)
+% 4. Bitstream generation (requires HDL Coder + SoC Blockset + Vivado)
 cd soc; build_bitstream
 ```
 
@@ -43,10 +34,12 @@ cd soc; build_bitstream
 ```
 matlab/
 ├── src/           MATLAB functions (HDL Coder targets)
-├── testbench/     Tests and test data generators
+├── test/          matlab.unittest test suite
+├── testbench/     Test data generators and compatibility scripts
 ├── fixedpoint/    Fixed-Point Advisor configuration
 ├── cosim/         HDL Verifier cosimulation
 ├── model/         Simulink models (.slx)
+├── run_matlab_tests.m
 └── soc/           SoC Builder configuration
 ```
 
@@ -55,14 +48,14 @@ matlab/
 ### Phase A: Floating-Point Verification
 
 1. Edit algorithm in `src/*.m` (all signals are `double`)
-2. Run `tb_full_sweep` and `tb_paper_vs_fpga` to compare against the paper reference
+2. Run `run_matlab_tests` to execute the MATLAB unit and integration suite
 3. Iterate until all tests pass
 
 ### Phase B: Fixed-Point Conversion
 
 1. Run `fixedpoint/fp_config.m` to analyze dynamic range
 2. Open Simulink model -> Fixed-Point Tool -> apply proposed types
-3. Re-run `tb_full_sweep` to verify zero-error conversion
+3. Re-run `run_matlab_tests` to verify zero-error conversion
 4. Target bit widths: value=16, penalty=16, offset=8 (matching HLS)
 
 ### Phase C: HDL Generation and Cosimulation
@@ -83,7 +76,7 @@ matlab/
 From project root:
 
 ```bash
-make matlab-sim        # Run tb_full_sweep
+make matlab-sim        # Run matlab.unittest suite
 make matlab-hdl        # Generate HDL
 make matlab-cosim      # Run cosimulation
 make matlab-bitstream  # Build bitstream
