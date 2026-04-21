@@ -1,21 +1,27 @@
 # ===========================================================================
 # build_vivado.tcl — Vivado synthesis, implementation, bitstream
-# Usage: vivado -mode batch -source build_vivado.tcl -tclargs <tile|stream>
+# Usage: vivado -mode batch -source build_vivado.tcl -tclargs <tile|stream|matlab>
 # ===========================================================================
 
 if {$argc < 2} {
-    error "Usage: vivado -mode batch -source build_vivado.tcl -tclargs <tile|stream> <build_dir>"
+    error "Usage: vivado -mode batch -source build_vivado.tcl -tclargs <tile|stream|matlab> <build_dir>"
 }
 set variant   [lindex $argv 0]
 set build_dir [file normalize [lindex $argv 1]]
-if {$variant ni {tile stream}} {
-    error "Invalid variant '$variant'. Must be 'tile' or 'stream'."
+if {$variant ni {tile stream matlab}} {
+    error "Invalid variant '$variant'. Must be 'tile', 'stream', or 'matlab'."
 }
 
 set script_dir   [file normalize [file dirname [info script]]]
 set project_name "vi_${variant}"
 set xpr_file     "$build_dir/$project_name/$project_name.xpr"
 set run_jobs 2
+
+if {$variant eq "matlab"} {
+    # The MATLAB-generated IP is large enough to exhaust memory when OOC
+    # synthesis runs are launched concurrently on typical development hosts.
+    set run_jobs 1
+}
 
 if {[info exists ::env(VI_VIVADO_JOBS)] && $::env(VI_VIVADO_JOBS) ne ""} {
     set run_jobs $::env(VI_VIVADO_JOBS)

@@ -20,6 +20,13 @@ fpga/vivado/ultra96v2/ip_repo*/
 *.o
 driver/uio/*.a
 driver/uio/*.so
+codegen/
+hdlsrc/
+slprj/
+*.mex*
+*.slxc
+tmp_*.slx
+myproj/
 
 # compiled binaries
 host/vi_cli

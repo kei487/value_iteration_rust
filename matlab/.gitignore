@@ -25,6 +25,11 @@ helpsearch*/
 slprj/
 sccprj/
 codegen/
+build/
+b/
+opcount_build/
+model/hdlsrc/
+soc/opcount_build/
 
 # Cache files
 *.slxc

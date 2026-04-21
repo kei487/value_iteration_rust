@@ -25,8 +25,8 @@ cd fixedpoint; fp_config
 % 3. HDL cosimulation (requires HDL Verifier + Vivado Xsim)
 cd cosim; cosim_tb
 
-% 4. Bitstream generation (requires HDL Coder + SoC Blockset + Vivado)
-cd soc; build_bitstream
+% 4. Export packaged IP for the repo Vivado flow
+addpath('src','model','fpga'); export_repo_ip
 ```
 
 ## Directory Structure
@@ -40,7 +40,8 @@ matlab/
 ├── cosim/         HDL Verifier cosimulation
 ├── model/         Simulink models (.slx)
 ├── run_matlab_tests.m
-└── soc/           SoC Builder configuration
+├── fpga/          Repo Vivado export helpers
+└── soc/           SoC Builder experiments / reference configuration
 ```
 
 ## Development Workflow
@@ -67,9 +68,13 @@ matlab/
 
 ### Phase D: Bitstream and Hardware
 
-1. Run `soc/build_bitstream.m` (or use HDL Workflow Advisor GUI)
-2. Deploy .bit + .hwh to Ultra96-V2
-3. Test via `vi_cli --verify` with MATLAB driver ops
+1. Run `make matlab-bitstream` from the repository root
+2. This regenerates the MATLAB HDL IP and builds `fpga/build/vi_matlab`
+3. The `matlab` Vivado variant runs with `jobs=1` by default because the
+   MATLAB-generated IP uses enough memory to fail on typical hosts when OOC
+   synthesis is launched in parallel
+4. Deploy the resulting `.bit` + `.hwh` from
+   `fpga/build/vi_matlab/vi_matlab.runs/impl_1/` to Ultra96-V2
 
 ## Makefile Targets
 
@@ -77,9 +82,9 @@ From project root:
 
 ```bash
 make matlab-sim        # Run matlab.unittest suite
-make matlab-hdl        # Generate HDL
+make matlab-hdl        # Export MATLAB HDL IP into fpga/build/matlab_ip_repo
 make matlab-cosim      # Run cosimulation
-make matlab-bitstream  # Build bitstream
+make matlab-bitstream  # Build Ultra96-V2 bitstream from the exported IP
 ```
 
 ## Constants

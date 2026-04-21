@@ -8,7 +8,7 @@ function build_bitstream()
     cfg = soc_config();
     model_name = 'vi_sweep_stream_matlab';
     model_dir = fullfile(fileparts(mfilename('fullpath')), '..', 'model');
-    build_dir = fullfile(fileparts(mfilename('fullpath')), '..', 'build');
+    build_dir = fullfile(fileparts(mfilename('fullpath')), '..', cfg.build_dirname);
 
     fprintf('=== SoC Builder Bitstream Generation ===\n');
     fprintf('Board: %s\n', cfg.board);
@@ -20,8 +20,9 @@ function build_bitstream()
         mkdir(build_dir);
     end
 
-    % Load model
+    register_custom_board_support(cfg);
     addpath(model_dir);
+    create_model();
     load_system(model_name);
     cleanup = onCleanup(@() close_system_if_loaded(model_name));
 
@@ -64,6 +65,7 @@ function [dut_path, hWC, chosen_target, chosen_reference, issues] = ...
 
     hdlset_param(model_name, 'Workflow', cfg.workflow);
     hdlset_param(model_name, 'SynthesisTool', 'Xilinx Vivado');
+    hdlset_param(model_name, 'UseFloatingPoint', 'off');
 
     if ~isempty(cfg.reference_design_path)
         hdlset_param(model_name, 'ReferenceDesignPath', cfg.reference_design_path);
@@ -71,7 +73,7 @@ function [dut_path, hWC, chosen_target, chosen_reference, issues] = ...
 
     [chosen_target, target_issue] = choose_target_platform(model_name, cfg);
     if ~isempty(target_issue)
-        issues{end + 1} = target_issue; %#ok<AGROW>
+        issues{end + 1} = target_issue;
     end
 
     chosen_reference = '';
@@ -79,11 +81,36 @@ function [dut_path, hWC, chosen_target, chosen_reference, issues] = ...
         [chosen_reference, reference_issue] = choose_reference_design( ...
             model_name, cfg, chosen_target);
         if ~isempty(reference_issue)
-            issues{end + 1} = reference_issue; %#ok<AGROW>
+            issues{end + 1} = reference_issue;
         end
     end
 
     hWC = create_workflow_config(cfg, build_dir);
+end
+
+function register_custom_board_support(cfg)
+    if isempty(cfg.board_support_root)
+        return;
+    end
+
+    if ~exist(cfg.board_support_root, 'dir')
+        error('build_bitstream:BoardSupportNotFound', ...
+              'Custom board support root does not exist: %s', ...
+              cfg.board_support_root);
+    end
+
+    addpath(cfg.board_support_root);
+    rehash path;
+
+    board_plugin = sprintf('%s.plugin_board', cfg.board_plugin_package);
+    try
+        feval(board_plugin);
+    catch ME
+        error('build_bitstream:BoardPluginNotFound', ...
+              ['Custom board plugin `%s` could not be loaded from `%s`.\n', ...
+               'Reason: %s'], ...
+              board_plugin, cfg.board_support_root, sanitize_message(ME.message));
+    end
 end
 
 function hWC = create_workflow_config(cfg, build_dir)
@@ -91,7 +118,7 @@ function hWC = create_workflow_config(cfg, build_dir)
         'SynthesisTool', 'Xilinx Vivado', ...
         'TargetWorkflow', cfg.workflow);
 
-    hWC.ProjectFolder = fullfile(build_dir, cfg.project_dirname);
+    hWC.ProjectFolder = prepare_project_folder(build_dir, cfg.project_dirname);
     hWC.AllowUnsupportedToolVersion = cfg.allow_unsupported_tool_version;
     hWC.IgnoreToolVersionMismatch = cfg.ignore_tool_version_mismatch;
     if ~isempty(cfg.reference_design_tool_version)
@@ -110,6 +137,57 @@ function hWC = create_workflow_config(cfg, build_dir)
     hWC.GenerateSoftwareInterfaceModel = cfg.generate_software_interface_model;
     hWC.GenerateHostInterfaceScript = cfg.generate_host_interface_script;
     hWC.GenerateHostInterfaceModel = false;
+end
+
+function project_folder = prepare_project_folder(build_dir, project_dirname)
+    base_project_folder = fullfile(build_dir, project_dirname);
+    if ~exist(base_project_folder, 'dir')
+        project_folder = base_project_folder;
+        return;
+    end
+
+    if ~has_stale_vivado_state(base_project_folder)
+        project_folder = base_project_folder;
+        return;
+    end
+
+    ensure_within_build_dir(build_dir, base_project_folder);
+    fprintf(['Detected stale Vivado run markers in existing project folder.\n', ...
+             'Removing generated build folder and recreating: %s\n'], ...
+            base_project_folder);
+    [ok, msg, msgid] = rmdir(base_project_folder, 's');
+    if ~ok
+        error('build_bitstream:ProjectCleanupFailed', ...
+              'Failed to remove stale project folder `%s` (%s: %s).', ...
+              base_project_folder, msgid, msg);
+    end
+    project_folder = base_project_folder;
+end
+
+function tf = has_stale_vivado_state(project_folder)
+    marker_patterns = { ...
+        fullfile(project_folder, '**', '__synthesis_is_running__')
+        fullfile(project_folder, '**', '.vivado.begin.rst')
+        fullfile(project_folder, '**', '.vivado.error.rst')
+    };
+
+    tf = false;
+    for idx = 1:numel(marker_patterns)
+        if ~isempty(dir(marker_patterns{idx}))
+            tf = true;
+            return;
+        end
+    end
+end
+
+function ensure_within_build_dir(build_dir, target_path)
+    build_root = lower(char(string(build_dir)));
+    target = lower(char(string(target_path)));
+    expected_prefix = [build_root filesep];
+    if ~(strcmp(target, build_root) || startsWith(target, expected_prefix))
+        error('build_bitstream:UnsafeCleanupPath', ...
+              'Refusing to delete path outside build dir: %s', target_path);
+    end
 end
 
 function [chosen_target, issue] = choose_target_platform(model_name, cfg)
@@ -194,7 +272,7 @@ function issues = validate_batch_prereqs()
     cpp_cfg = mex.getCompilerConfigurations('C++', 'Selected');
     if isempty(cpp_cfg)
         issues{end + 1} = ['No supported C++ compiler is configured for MATLAB code generation. ', ...
-                           'Run `mex -setup C++` or install MinGW-w64 support, then restart MATLAB.']; %#ok<AGROW>
+                           'Run `mex -setup C++` or install MinGW-w64 support, then restart MATLAB.'];
     else
         fprintf('C++ compiler: %s\n', cpp_cfg.Name);
     end
@@ -203,7 +281,7 @@ function issues = validate_batch_prereqs()
     if vivado_ok
         fprintf('Vivado: %s\n', vivado_msg);
     else
-        issues{end + 1} = vivado_msg; %#ok<AGROW>
+        issues{end + 1} = vivado_msg;
     end
 end
 

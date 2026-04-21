@@ -6,7 +6,10 @@ function cfg = soc_config()
     cfg.vivado_version = '2025.2';
     cfg.clock_freq_mhz = 100;
     cfg.workflow = 'IP Core Generation';
-    cfg.project_dirname = 'hdl_prj';
+    cfg.build_dirname = 'b';
+    cfg.project_dirname = 'p';
+    cfg.board_plugin_package = 'Ultra96V2';
+    cfg.board_support_root = fullfile(fileparts(mfilename('fullpath')), '..', 'board_support');
 
     % The real target is Ultra96-V2. Keep fallback opt-in because building for a
     % different board produces artifacts that are not deployable to hardware.
@@ -23,13 +26,13 @@ function cfg = soc_config()
         'Default system with External DDR3 Memory Access', ...
         'Default system' ...
     };
-    cfg.reference_design_path = '';
-    cfg.reference_design_tool_version = '';
+    cfg.reference_design_path = cfg.board_support_root;
+    cfg.reference_design_tool_version = cfg.vivado_version;
 
     cfg.allow_unsupported_tool_version = true;
     cfg.ignore_tool_version_mismatch = true;
-    cfg.run_external_build = true;
-    cfg.run_model_analyzer = true;
+    cfg.run_external_build = false;
+    cfg.run_model_analyzer = false;
     cfg.generate_software_interface = false;
     cfg.generate_software_interface_model = false;
     cfg.generate_host_interface_script = false;

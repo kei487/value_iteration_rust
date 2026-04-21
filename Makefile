@@ -61,13 +61,13 @@ matlab-sim:
 	cd matlab && matlab -batch "run_matlab_tests"
 
 matlab-hdl:
-	cd matlab && matlab -batch "addpath('src','model'); cd model; create_model"
+	cd matlab && matlab -batch "addpath('src','model','fpga'); export_repo_ip"
 
 matlab-cosim:
 	cd matlab && matlab -batch "addpath('src','test'); cd cosim; cosim_tb"
 
-matlab-bitstream:
-	cd matlab && matlab -batch "addpath('src','model'); cd soc; build_bitstream"
+matlab-bitstream: matlab-hdl
+	vivado -mode batch -source "fpga/tcl/build_vivado.tcl" -tclargs matlab "fpga/build"
 
 # ---------- Clean ----------
 
