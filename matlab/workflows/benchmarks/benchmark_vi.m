@@ -1,5 +1,5 @@
 function rows = benchmark_vi()
-%BENCHMARK_VI Speed/accuracy comparison across 5 VI implementations.
+%BENCHMARK_VI Speed/accuracy comparison across VI implementations.
 %
 %   For each case from bench_cases() runs:
 %     ref     : vi_full_reference  (oracle; existing)
@@ -7,6 +7,7 @@ function rows = benchmark_vi()
 %     f2d     : vi_frontier_2d        (frontier-VI, 2D spatial bitboard)
 %     f3d     : vi_frontier_3d        (frontier-VI, 3D (x,y,theta) bitboard)
 %     fstack  : vi_frontier_stack     (frontier-VI, 60 stacked 2D bitboards)
+%     block   : vi_block_refine       (block-frontier VI, fine updates)
 %
 %   Writes Markdown summary to stdout and CSV to matlab/artifacts/benchmarks/results/.
 
@@ -21,11 +22,13 @@ function rows = benchmark_vi()
 
     cases = bench_cases();
     rows = repmat(empty_row(), 1, numel(cases));
+    n_cases = numel(cases);
+    n_impls = 6;
 
-    fprintf('Running %d cases...\n', numel(cases));
-    for k = 1:numel(cases)
+    fprintf('=== benchmark phase (%d cases x %d impls) ===\n', n_cases, n_impls);
+    for k = 1:n_cases
         c = cases(k);
-        fprintf('  [%2d/%2d] %-14s ', k, numel(cases), c.name);
+        fprintf('  [%2d/%2d] %-14s\n', k, n_cases, c.name);
 
         [value0, penalty, ~, ~, goal_mask] = gen_test_map( ...
             c.map_x, c.map_y, c.type, c.opts);
@@ -67,11 +70,18 @@ function rows = benchmark_vi()
             c.map_x, c.map_y, max_frontier_iters);
         t_fstack_ms = toc(t0) * 1000;
 
+        t0 = tic;
+        [v_block, it_block, up_block] = vi_block_refine( ...
+            value0, penalty, goal_mask, transitions, ...
+            c.map_x, c.map_y, max_frontier_iters, 8, 8, 2, threshold);
+        t_block_ms = toc(t0) * 1000;
+
         % --- Mismatch metrics vs oracle ---------------------------------
         m_fpga   = compute_bench_metrics(v_ref, v_fpga,   a_ref, a_fpga,   goal_mask, penalty, p);
         m_f2d    = compute_bench_metrics(v_ref, v_f2d,    a_ref, [],       goal_mask, penalty, p);
         m_f3d    = compute_bench_metrics(v_ref, v_f3d,    a_ref, [],       goal_mask, penalty, p);
         m_fstack = compute_bench_metrics(v_ref, v_fstack, a_ref, [],       goal_mask, penalty, p);
+        m_block  = compute_bench_metrics(v_ref, v_block,  a_ref, [],       goal_mask, penalty, p);
 
         rows(k) = struct( ...
             'name',                c.name, ...
@@ -104,19 +114,28 @@ function rows = benchmark_vi()
             'fstack_total_updates',     up_fstack, ...
             'fstack_total_ms',          t_fstack_ms, ...
             'fstack_per_update_us',     1000 * t_fstack_ms / max(up_fstack, 1), ...
-            'fstack_value_mismatch_pct', m_fstack.value_mismatch_pct);
+            'fstack_value_mismatch_pct', m_fstack.value_mismatch_pct, ...
+            'block_iters',              it_block, ...
+            'block_total_updates',      up_block, ...
+            'block_total_ms',           t_block_ms, ...
+            'block_per_update_us',      1000 * t_block_ms / max(up_block, 1), ...
+            'block_value_mismatch_pct', m_block.value_mismatch_pct);
 
-        fprintf(['ref=%6.1fms  fpga=%6.1fms  ' ...
-                 'f2d=%6.1fms (%diter,%dup)  ' ...
-                 'f3d=%6.1fms (%diter,%dup)  ' ...
-                 'fstack=%6.1fms (%diter,%dup)\n'], ...
-            t_ref_ms, t_fpga_ms, ...
-            t_f2d_ms,   it_f2d,   up_f2d, ...
-            t_f3d_ms,   it_f3d,   up_f3d, ...
-            t_fstack_ms, it_fstack, up_fstack);
+        fprintf('    %-15s M=%7.1fms (%4d sw)\n', ...
+            'reference', t_ref_ms, sw_ref);
+        fprintf('    %-15s M=%7.1fms (%4d sw)%s\n', ...
+            'fpga_mimic', t_fpga_ms, sw_fpga, accuracy_flag(m_fpga, true));
+        fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
+            'frontier_2d', t_f2d_ms, it_f2d, accuracy_flag(m_f2d, false));
+        fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
+            'frontier_3d', t_f3d_ms, it_f3d, accuracy_flag(m_f3d, false));
+        fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
+            'frontier_stack', t_fstack_ms, it_fstack, accuracy_flag(m_fstack, false));
+        fprintf('    %-15s M=%7.1fms (%4d it)%s\n', ...
+            'block_refine', t_block_ms, it_block, accuracy_flag(m_block, false));
 
         % Regression guard: frontier variants must be bit-exact to oracle.
-        for tag = {'f2d', 'f3d', 'fstack'}
+        for tag = {'f2d', 'f3d', 'fstack', 'block'}
             field = sprintf('%s_value_mismatch_pct', tag{1});
             if rows(k).(field) ~= 0
                 warning('benchmark_vi:mismatch', ...
@@ -150,7 +169,9 @@ function row = empty_row()
         'f3d_iters', 0, 'f3d_total_updates', 0, 'f3d_total_ms', 0, ...
         'f3d_per_update_us', 0, 'f3d_value_mismatch_pct', 0, ...
         'fstack_iters', 0, 'fstack_total_updates', 0, 'fstack_total_ms', 0, ...
-        'fstack_per_update_us', 0, 'fstack_value_mismatch_pct', 0);
+        'fstack_per_update_us', 0, 'fstack_value_mismatch_pct', 0, ...
+        'block_iters', 0, 'block_total_updates', 0, 'block_total_ms', 0, ...
+        'block_per_update_us', 0, 'block_value_mismatch_pct', 0);
 end
 
 function warmup(value, penalty, goal_mask, transitions, map_x, map_y)
@@ -162,6 +183,7 @@ function warmup(value, penalty, goal_mask, transitions, map_x, map_y)
     vi_frontier_2d(value, penalty, goal_mask, transitions, map_x, map_y, 1);
     vi_frontier_3d(value, penalty, goal_mask, transitions, map_x, map_y, 1);
     vi_frontier_stack(value, penalty, goal_mask, transitions, map_x, map_y, 1);
+    vi_block_refine(value, penalty, goal_mask, transitions, map_x, map_y, 1, 8, 8, 1, 0);
 end
 
 function [v, sweeps, final_delta] = run_fpga_mimic(value, penalty, goal_mask, ...
@@ -212,21 +234,40 @@ function m = compute_bench_metrics(v_ref, v_other, a_ref, a_other, goal_mask, pe
         'max_abs_value',       max(abs(double(v_other_f) - double(v_ref_f))));
 end
 
+function flag = accuracy_flag(metrics, include_action)
+    flags = {};
+    if metrics.value_mismatch_pct ~= 0
+        flags{end + 1} = sprintf('vmiss=%.2f%%', metrics.value_mismatch_pct);
+    end
+    if include_action && metrics.action_mismatch_pct ~= 0
+        flags{end + 1} = sprintf('amiss=%.2f%%', metrics.action_mismatch_pct);
+    end
+
+    if isempty(flags)
+        flag = '';
+    else
+        flag = sprintf('  ! %s', strjoin(flags, ' '));
+    end
+end
+
 function print_markdown_table(rows)
     fprintf('\n');
     fprintf(['| name | size | ref_ms | fpga_ms | f2d_ms | f2d_iter | f2d_up | ' ...
-             'f3d_ms | f3d_iter | f3d_up | fstack_ms | fst_iter | fst_up |\n']);
+             'f3d_ms | f3d_iter | f3d_up | fstack_ms | fst_iter | fst_up | ' ...
+             'block_ms | blk_iter | blk_up |\n']);
     fprintf(['|------|------|-------:|--------:|-------:|---------:|-------:|' ...
-             '-------:|---------:|-------:|----------:|---------:|-------:|\n']);
+             '-------:|---------:|-------:|----------:|---------:|-------:|' ...
+             '---------:|---------:|-------:|\n']);
     for k = 1:numel(rows)
         r = rows(k);
         fprintf(['| %s | %dx%d | %.1f | %.1f | %.1f | %d | %d | ' ...
-                 '%.1f | %d | %d | %.1f | %d | %d |\n'], ...
+                 '%.1f | %d | %d | %.1f | %d | %d | %.1f | %d | %d |\n'], ...
             r.name, r.map_x, r.map_y, ...
             r.ref_total_ms, r.fpga_total_ms, ...
             r.f2d_total_ms,    r.f2d_iters,    r.f2d_total_updates, ...
             r.f3d_total_ms,    r.f3d_iters,    r.f3d_total_updates, ...
-            r.fstack_total_ms, r.fstack_iters, r.fstack_total_updates);
+            r.fstack_total_ms, r.fstack_iters, r.fstack_total_updates, ...
+            r.block_total_ms,  r.block_iters,  r.block_total_updates);
     end
 end
 
@@ -235,7 +276,7 @@ function write_csv(rows, path)
     if fid < 0
         error('benchmark_vi:csv', 'cannot open %s for writing', path);
     end
-    cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
+    cleanup = onCleanup(@() fclose(fid));
 
     field_names = fieldnames(rows(1));
     fprintf(fid, '%s\n', strjoin(field_names, ','));
