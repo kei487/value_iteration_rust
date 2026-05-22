@@ -1,0 +1,30 @@
+# HLS / Vivado build artifacts
+build/
+**/solution*/
+.hls.failed
+dfx_runtime.txt
+
+# Vivado generated IP repos
+vivado/ultra96v2/ip_repo*/
+
+# Driver build outputs
+driver/uio/*.a
+driver/uio/*.so
+
+# Host compiled binaries
+host/vi_cli
+host/vi_cli_mock
+host/test/test_map_pgm
+host/test/test_penalty
+host/test/test_transitions
+host/test/test_vi_run_mock
+host/test/test_action_table
+host/test/test_reference_eq
+
+# PetaLinux build artifacts
+petalinux/edf/
+petalinux/sstate-cache/
+petalinux/downloads/
+petalinux/output/
+petalinux/project/
+petalinux/docker/*.run

@@ -25,10 +25,10 @@ helpsearch*/
 slprj/
 sccprj/
 codegen/
+hdlsrc/
 build/
 b/
 opcount_build/
-model/hdlsrc/
 soc/opcount_build/
 bench/codegen_build/
 artifacts/benchmarks/codegen_build/
@@ -40,7 +40,10 @@ artifacts/opcount_build/
 artifacts/slprj/
 artifacts/soc/
 artifacts/simulink_cache/
-platforms/fpga/model/hdlsrc/
+
+# Simulink temp / project artifacts
+tmp_*.slx
+myproj/
 
 # Cache files
 *.slxc

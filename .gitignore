@@ -1,45 +1,10 @@
-# FPGA build artifacts
-fpga/build/
-fpga/**/solution*/
-.hls.failed
-dfx_runtime.txt
-
-# EDF / PetaLinux build artifacts
+# Top-level EDF checkout (outside vi_fpga)
 edf/
-petalinux/edf/
-petalinux/sstate-cache/
-petalinux/downloads/
-petalinux/output/
-petalinux/project/
-petalinux/docker/*.run
 
-# Vivado generated IP repos
-fpga/vivado/ultra96v2/ip_repo*/
-
-# C build artifacts
+# C object files (global)
 *.o
-driver/uio/*.a
-driver/uio/*.so
-codegen/
-hdlsrc/
-slprj/
-*.mex*
-*.slxc
-tmp_*.slx
-myproj/
-vi_matlab/bench/results/
 
-# compiled binaries
-host/vi_cli
-host/vi_cli_mock
-host/test/test_map_pgm
-host/test/test_penalty
-host/test/test_transitions
-host/test/test_vi_run_mock
-host/test/test_action_table
-host/test/test_reference_eq
-
-# OS
+# OS / Vivado / Vitis tool logs
 .Xil/
 *.jou
 *.log
