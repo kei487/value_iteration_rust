@@ -32,7 +32,7 @@ setup_matlab_paths('fpga-export'); export_repo_ip
 ## Directory Structure
 
 ```
-matlab/
+vi_matlab/
 ├── src/
 │   ├── common/    Shared helpers and constants
 │   ├── cpu/       CPU/reference/frontier implementations

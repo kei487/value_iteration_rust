@@ -9,7 +9,7 @@ function rows = benchmark_vi()
 %     fstack  : vi_frontier_stack     (frontier-VI, 60 stacked 2D bitboards)
 %     pyramid : vi_pyramid_sweep      (2x2 aggregation pyramid sweep)
 %
-%   Writes Markdown summary to stdout and CSV to matlab/artifacts/benchmarks/results/.
+%   Writes Markdown summary to stdout and CSV to vi_matlab/artifacts/benchmarks/results/.
 
     layout = vi_matlab_layout();
     setup_matlab_paths('src', 'tests');

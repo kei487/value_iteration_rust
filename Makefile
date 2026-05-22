@@ -59,32 +59,32 @@ edf-build:
         matlab-bench matlab-bench-codegen matlab-codegen-build matlab-codegen-clean
 
 matlab-sim:
-	cd matlab && matlab -batch "run_matlab_tests"
+	cd vi_matlab && matlab -batch "run_matlab_tests"
 
 matlab-hdl:
-	cd matlab && matlab -batch "setup_matlab_paths('fpga-export'); export_repo_ip"
+	cd vi_matlab && matlab -batch "setup_matlab_paths('fpga-export'); export_repo_ip"
 
 matlab-cosim:
-	cd matlab && matlab -batch "setup_matlab_paths('validation','tests'); cosim_tb"
+	cd vi_matlab && matlab -batch "setup_matlab_paths('validation','tests'); cosim_tb"
 
 matlab-bitstream: matlab-hdl
 	vivado -mode batch -source "fpga/tcl/build_vivado.tcl" -tclargs matlab "fpga/build"
 
 matlab-bench:
-	cd matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); benchmark_vi"
+	cd vi_matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); benchmark_vi"
 
 # MATLAB Coder C-generation benchmark: builds MEX from vi_full_reference and
 # vi_sweep_stream_algo, then compares MATLAB vs codegen-C timings on bench_cases.
 # Pass REBUILD=1 to force a clean rebuild of the MEX artifacts.
 REBUILD ?= 0
 matlab-bench-codegen:
-	cd matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); benchmark_vi_codegen('rebuild', logical($(REBUILD)))"
+	cd vi_matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); benchmark_vi_codegen('rebuild', logical($(REBUILD)))"
 
 matlab-codegen-build:
-	cd matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); codegen_build('rebuild', logical($(REBUILD)))"
+	cd vi_matlab && matlab -batch "setup_matlab_paths('src','tests','bench'); codegen_build('rebuild', logical($(REBUILD)))"
 
 matlab-codegen-clean:
-	rm -rf matlab/artifacts/benchmarks/codegen_build
+	rm -rf vi_matlab/artifacts/benchmarks/codegen_build
 
 # ---------- Clean ----------
 

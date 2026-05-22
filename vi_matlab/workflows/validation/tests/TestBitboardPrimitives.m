@@ -1,5 +1,5 @@
 classdef TestBitboardPrimitives < TestBase
-%TESTBITBOARDPRIMITIVES Low-level checks for matlab/src/shared/bitboard helpers.
+%TESTBITBOARDPRIMITIVES Low-level checks for vi_matlab/src/shared/bitboard helpers.
 
     methods (Test)
         function testWordsPerRow(testCase)
