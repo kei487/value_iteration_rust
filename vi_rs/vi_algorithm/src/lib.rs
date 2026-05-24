@@ -9,5 +9,5 @@ pub mod kernel;
 pub mod reference;
 
 pub use context::{Budget, MapDims, SolveExtra, SolveStats, Solver, VIContext};
-pub use frontier::{Frontier2D, Frontier3D, FrontierStack};
+pub use frontier::{Frontier2D, Frontier3D, Frontier3DCoarseTheta, Frontier3DTau, Frontier3DTopK, FrontierStack};
 pub use reference::Reference;

@@ -3,13 +3,19 @@
 //!
 //! See `docs/superpowers/specs/2026-05-22-vi-rs-algorithm-port-design.md` §4.2, §4.8.
 
+pub mod coarse_theta;
 pub mod f2d;
 pub mod f3d;
 pub mod stack;
+pub mod tau;
+pub mod topk;
 
+pub use coarse_theta::Frontier3DCoarseTheta;
 pub use f2d::Frontier2D;
 pub use f3d::Frontier3D;
 pub use stack::FrontierStack;
+pub use tau::Frontier3DTau;
+pub use topk::Frontier3DTopK;
 
 use ndarray::{Array2, Array3};
 use vi_core::{MAX_VALUE, Penalty, Value, PENALTY_OBSTACLE};
