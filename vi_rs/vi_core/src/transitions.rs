@@ -10,6 +10,7 @@ pub struct PackedTransitions(pub Vec<u32>);
 // NOTE: #[derive(Default)] is not used here because Rust does not implement Default for
 // arrays longer than 32 elements on stable toolchains older than 1.87. The manual impl below
 // is equivalent and kept for portability.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TransitionModel {
     pub n_outcomes: [[u8; N_THETA]; N_ACTIONS],
     pub dix: [[[Offset; MAX_OUTCOMES]; N_THETA]; N_ACTIONS],
