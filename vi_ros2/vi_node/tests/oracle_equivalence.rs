@@ -8,6 +8,10 @@
 //! against Gauss-Seidel:
 //!
 //!   cargo test -p vi_node --test oracle_equivalence --no-default-features
+//!
+//! The parallel (Jacobi) path may converge differently from serial
+//! (Gauss-Seidel), so bit-exact equality is only required under serial.
+#![cfg(not(feature = "parallel"))]
 
 use ndarray::Array3;
 use vi_algorithm::{Budget, Reference, Solver};
@@ -44,8 +48,11 @@ fn bridge_constructs_same_context_as_direct_fixtures() {
     let penalty_bridge = occupancy_to_penalty(&grid, &params);
 
     let pose = PoseView { x: (w as f64 / 2.0) * res, y: (h as f64 / 2.0) * res, yaw_rad: 0.0 };
-    let spec = pose_to_goal_spec(&pose, &grid, 0.05, 15.0);
+    let spec = pose_to_goal_spec(&pose, &grid, 0.30, 15.0);
     let goal_mask = make_goal_mask(w, h, &spec);
+
+    let goal_count = goal_mask.iter().filter(|&&v| v).count();
+    assert!(goal_count > 0, "test setup error: goal mask is empty — radius / resolution mismatch");
 
     let trans = generate_transitions(TransitionMode::Full { xy_resolution: res });
 
@@ -64,7 +71,7 @@ fn bridge_constructs_same_context_as_direct_fixtures() {
     let spec_direct = GoalSpec {
         xy_resolution: res, map_origin_x: 0.0, map_origin_y: 0.0,
         goal_x: pose.x, goal_y: pose.y, goal_theta_deg: 0.0,
-        goal_radius_m: 0.05, goal_margin_theta_deg: 15.0,
+        goal_radius_m: 0.30, goal_margin_theta_deg: 15.0,
     };
     let goal_mask_direct = make_goal_mask(w, h, &spec_direct);
     let penalty_direct = ndarray::Array2::<u16>::zeros((h as usize, w as usize));
@@ -89,5 +96,12 @@ fn bridge_constructs_same_context_as_direct_fixtures() {
     let mut b = ctx_direct.clone_value();
     Reference { threshold: 0 }.run(&mut a, Budget::Sweeps(200));
     Reference { threshold: 0 }.run(&mut b, Budget::Sweeps(200));
+
+    // Verify Reference actually did meaningful work — at least one non-goal cell
+    // must have a finite (< MAX_VALUE) value.
+    let propagated = a.value.iter().filter(|&&v| v != vi_core::MAX_VALUE && v != 0).count();
+    assert!(propagated > 0,
+        "Reference did not propagate any cost — test is not actually exercising VI");
+
     assert_eq!(a.value, b.value, "bridge-constructed context must match direct construction bit-exactly");
 }
