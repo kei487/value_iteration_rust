@@ -4,13 +4,16 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ORIG="${VI_ORIG:-$(cd "$REPO_ROOT/.." && pwd)/value_iteration}"
 RESULTS="$REPO_ROOT/vi_compare/results"
-mkdir -p "$RESULTS"
+# 本家 catkin ビルドの永続キャッシュ (--rm コンテナ間で /catkin_ws を保持し再コンパイルを回避)。
+CATKIN_CACHE="$REPO_ROOT/vi_compare/.cache/catkin_ws"
+mkdir -p "$RESULTS" "$CATKIN_CACHE"
 
 echo "== [1/3] ROS1 (本家) =="
 docker run --rm \
   -v "$ORIG":/src_value_iteration:ro \
   -v "$REPO_ROOT":/workspace \
   -v "$RESULTS":/results \
+  -v "$CATKIN_CACHE":/catkin_ws \
   vi_compare_ros1:noetic \
   bash /workspace/vi_compare/ros1/run_ros1_bench.sh
 

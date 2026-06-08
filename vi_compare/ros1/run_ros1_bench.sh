@@ -6,9 +6,10 @@ source /opt/ros/noetic/setup.bash
 mkdir -p /catkin_ws/src
 ln -sfn /src_value_iteration /catkin_ws/src/value_iteration
 cd /catkin_ws
-if [ ! -f devel/setup.bash ]; then
-  catkin_make
-fi
+# /catkin_ws はホスト側 vi_compare/.cache/catkin_ws にマウントして永続化する。
+# catkin_make は増分ビルド: 初回はフルビルド、以降は本家 C++ が未変更ならほぼ no-op
+# (devel/build がキャッシュされるため毎回の再コンパイルを避けられる)。
+catkin_make
 source devel/setup.bash
 roslaunch /workspace/vi_compare/ros1/bench.launch \
   map_yaml:=/src_value_iteration/maps/house.yaml &

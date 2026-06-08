@@ -17,3 +17,6 @@ edf/
 
 # Python bytecode caches (vi_compare bench clients / compare tooling)
 __pycache__/
+
+# vi_compare 本家 catkin ビルドの永続キャッシュ (compare-bench で再コンパイル回避)
+/vi_compare/.cache/

@@ -156,9 +156,11 @@ compare-build: ros2-docker
 	docker build -t $(VI_COMPARE_ROS1_IMG) -f vi_compare/docker/Dockerfile.ros1 vi_compare/docker
 
 compare-ros1:
+	mkdir -p $(PWD)/vi_compare/.cache/catkin_ws
 	docker run --rm \
 	  -v $(VI_ORIG):/src_value_iteration:ro \
 	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  -v $(PWD)/vi_compare/.cache/catkin_ws:/catkin_ws \
 	  $(VI_COMPARE_ROS1_IMG) bash /workspace/vi_compare/ros1/run_ros1_bench.sh
 
 compare-ros2:
