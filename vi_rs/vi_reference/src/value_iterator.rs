@@ -69,6 +69,44 @@ impl ValueIterator {
     pub fn in_map_area(&self, ix: i32, iy: i32) -> bool {
         ix >= 0 && ix < self.cell_num_x && iy >= 0 && iy < self.cell_num_y
     }
+
+    /// 本家 `setStateTransition`。θ ごとに 1 スレッドで遷移生成 (書き込み先が
+    /// θ 独立なので結果は決定的)。各 action の `state_transitions[it]` を埋める。
+    pub(crate) fn set_state_transition(&mut self) {
+        let cell_num_t = self.cell_num_t;
+        let xy_resolution = self.xy_resolution;
+        let t_resolution = self.t_resolution;
+
+        for a in self.actions.iter_mut() {
+            a.state_transitions = vec![Vec::new(); cell_num_t as usize];
+        }
+
+        let action_params: Vec<(f64, f64)> =
+            self.actions.iter().map(|a| (a.delta_fw, a.delta_rot)).collect();
+
+        // per_theta[it][a] を θ 並列で計算。
+        let per_theta: Vec<Vec<Vec<StateTransition>>> = std::thread::scope(|scope| {
+            let ap = &action_params;
+            let handles: Vec<_> = (0..cell_num_t)
+                .map(|it| {
+                    scope.spawn(move || {
+                        ap.iter()
+                            .map(|&(fw, rot)| {
+                                compute_theta_transitions(fw, rot, it, xy_resolution, t_resolution)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (it, per_action) in per_theta.into_iter().enumerate() {
+            for (a, list) in per_action.into_iter().enumerate() {
+                self.actions[a].state_transitions[it] = list;
+            }
+        }
+    }
 }
 
 // ── コア free 関数 (単スレッド経路とマルチスレッド経路で共有) ──
@@ -114,6 +152,54 @@ pub(crate) fn no_noise_state_transition(
         to_t += 360.0;
     }
     (to_x, to_y, to_t)
+}
+
+/// 本家 `setStateTransitionWorkerSub` の 1 (action, theta) 分。
+/// サブセルサンプリングで遷移先バケットを集計する。`dit` は絶対 θ。
+pub(crate) fn compute_theta_transitions(
+    delta_fw: f64,
+    delta_rot: f64,
+    it: i32,
+    xy_resolution: f64,
+    t_resolution: f64,
+) -> Vec<StateTransition> {
+    let theta_origin = it as f64 * t_resolution;
+    let xy_sample_num = 1i32 << RESOLUTION_XY_BIT; // 64
+    let t_sample_num = 1i32 << RESOLUTION_T_BIT; // 64
+    let xy_step = xy_resolution / xy_sample_num as f64;
+    let t_step = t_resolution / t_sample_num as f64;
+
+    let mut out: Vec<StateTransition> = Vec::new();
+
+    // 本家 `for(double o=0.5*step; o<limit; o+=step)` の f64 累積を忠実再現。
+    let mut oy = 0.5 * xy_step;
+    while oy < xy_resolution {
+        let mut ox = 0.5 * xy_step;
+        while ox < xy_resolution {
+            let mut ot = 0.5 * t_step;
+            while ot < t_resolution {
+                let (dx, dy, dt) =
+                    no_noise_state_transition(delta_fw, delta_rot, ox, oy, ot + theta_origin);
+                let (dix, diy, dit) = cell_delta(dx, dy, dt, xy_resolution, t_resolution);
+
+                let mut exist = false;
+                for s in out.iter_mut() {
+                    if s.dix == dix && s.diy == diy && s.dit == dit {
+                        s.prob += 1;
+                        exist = true;
+                        break;
+                    }
+                }
+                if !exist {
+                    out.push(StateTransition::new(dix, diy, dit, 1));
+                }
+                ot += t_step;
+            }
+            ox += xy_step;
+        }
+        oy += xy_step;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -166,5 +252,42 @@ mod tests {
         let (to_x, to_y, _) = no_noise_state_transition(0.3, 0.0, 0.0, 0.0, 0.0);
         assert!((to_x - 0.3).abs() < 1e-9);
         assert!(to_y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn prob_sum_equals_prob_base() {
+        // 任意 action・θで prob 総和 = 64^3 = 262144 = PROB_BASE。
+        let list = compute_theta_transitions(0.3, 0.0, 0, 0.05, 6.0);
+        let total: i64 = list.iter().map(|s| s.prob as i64).sum();
+        assert_eq!(total, super::PROB_BASE as i64);
+    }
+
+    #[test]
+    fn forward_theta0_moves_in_x() {
+        // 前進 fw=0.3, θ=0, res=0.05 → 主に dix≈6, diy=0, dit=0。
+        let list = compute_theta_transitions(0.3, 0.0, 0, 0.05, 6.0);
+        // 最頻バケット (prob 最大) を確認。
+        let top = list.iter().max_by_key(|s| s.prob).unwrap();
+        assert_eq!(top.diy, 0);
+        assert_eq!(top.dit, 0, "θ=0 の前進は絶対 θ=0");
+        assert!(top.dix >= 5 && top.dix <= 6, "dix was {}", top.dix);
+    }
+
+    #[test]
+    fn rotation_dit_is_absolute_theta() {
+        // 左回転 rot=+20, θ=0, t_res=6 → to_t≈20 → dit≈3 (絶対)、dix=diy=0。
+        let list = compute_theta_transitions(0.0, 20.0, 0, 0.05, 6.0);
+        let top = list.iter().max_by_key(|s| s.prob).unwrap();
+        assert_eq!(top.dix, 0);
+        assert_eq!(top.diy, 0);
+        assert_eq!(top.dit, 3, "rot+20 → 絶対 θ index 3");
+    }
+
+    #[test]
+    fn rotation_dit_absolute_at_theta30() {
+        // θ=30 (index 5, t_res=6 → θ_origin=30°), 左回転 +20 → to_t≈50 → dit≈8 (絶対)。
+        let list = compute_theta_transitions(0.0, 20.0, 5, 0.05, 6.0);
+        let top = list.iter().max_by_key(|s| s.prob).unwrap();
+        assert_eq!(top.dit, 8, "θ_origin30 + rot20 = 50° → index 8 (絶対)");
     }
 }
