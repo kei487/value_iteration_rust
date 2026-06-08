@@ -442,7 +442,10 @@ impl ValueIterator {
         }
     }
 
-    /// 本家 `valueFunctionWriter`。各 θ 層に `total_cost/prob_base`。
+    /// 本家 `valueFunctionWriter`。各 θ 層に `total_cost_/prob_base_`。
+    /// ★本家は uint64/uint64 の **整数除算** で小数を切り捨てる
+    /// (`map.at(...) = s.total_cost_/prob_base_;`)。`make_value_function_map` 側の
+    /// `(double)total_cost_/prob_base_` (浮動小数除算) とは非対称なので注意。
     pub fn value_function_writer(&self) -> GridLayers {
         let (nx, ny, nt) = (self.cell_num_x, self.cell_num_y, self.cell_num_t);
         let mut layers = vec![vec![0f64; (nx * ny) as usize]; nt as usize];
@@ -451,7 +454,7 @@ impl ValueIterator {
             while (i as usize) < self.states.len() {
                 let s = &self.states[i as usize];
                 layers[t as usize][(s.iy * nx + s.ix) as usize] =
-                    s.total_cost as f64 / PROB_BASE as f64;
+                    (s.total_cost / PROB_BASE) as f64;
                 i += nt;
             }
         }
@@ -1182,5 +1185,19 @@ mod tests {
         assert_eq!(pol.layers.len(), 60);
         // 未計算なので全 -1。
         assert!(pol.layers[0].iter().all(|&v| v == -1.0));
+    }
+
+    #[test]
+    fn value_function_writer_truncates_substep() {
+        // ★本家 valueFunctionWriter は total_cost_/prob_base_ の整数除算で小数を切り捨てる。
+        // total_cost = 1.5 step (PROB_BASE + PROB_BASE/2) → 報告値は floor = 1.0。
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(2, 2);
+        vi.set_map_with_occupancy_grid(&map, 4, 0.2, 30.0, 0.2, 10);
+        let idx = vi.to_index(0, 0, 0) as usize;
+        vi.states[idx].total_cost = super::PROB_BASE + super::PROB_BASE / 2; // 1.5 step
+        let gl = vi.value_function_writer();
+        // layer[theta=0] の (iy=0,ix=0) = floor(1.5) = 1.0 (浮動小数除算なら 1.5 になる)。
+        assert_eq!(gl.layers[0][0], 1.0);
     }
 }

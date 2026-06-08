@@ -15,5 +15,7 @@ roslaunch /workspace/vi_compare/ros1/bench.launch \
   map_yaml:=/src_value_iteration/maps/house.yaml &
 LAUNCH_PID=$!
 trap 'kill $LAUNCH_PID 2>/dev/null || true' EXIT
+# 第1引数で params を差し替え可能 (strict 比較は delta_threshold=-1, max_sweeps=F の params)。
+PARAMS="${1:-/workspace/vi_compare/params.yaml}"
 python3 /workspace/vi_compare/ros1/bench_client.py \
-  /workspace/vi_compare/params.yaml /results
+  "$PARAMS" /results

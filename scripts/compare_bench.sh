@@ -5,8 +5,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ORIG="${VI_ORIG:-$(cd "$REPO_ROOT/.." && pwd)/value_iteration}"
 RESULTS="$REPO_ROOT/vi_compare/results"
 # 本家 catkin ビルドの永続キャッシュ (--rm コンテナ間で /catkin_ws を保持し再コンパイルを回避)。
+# .cache 配下は Docker(root) が作成するので host では触らない。
 CATKIN_CACHE="$REPO_ROOT/vi_compare/.cache/catkin_ws"
-mkdir -p "$RESULTS" "$CATKIN_CACHE"
+mkdir -p "$RESULTS"
 
 echo "== [1/4] ROS1 (本家) =="
 docker run --rm \

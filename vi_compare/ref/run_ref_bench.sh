@@ -15,8 +15,10 @@ cd /tmp
 cargo build --release --manifest-path /workspace/vi_rs/Cargo.toml -p vi_reference --bin vi_ref_bench
 BIN=$CARGO_TARGET_DIR/release/vi_ref_bench
 
+# 第1引数で params を差し替え可能 (strict 比較は delta_threshold<0 の params を渡す)。
+PARAMS="${1:-/workspace/vi_compare/params.yaml}"
 python3 /workspace/vi_compare/ref/ref_bench.py \
-  /workspace/vi_compare/params.yaml \
+  "$PARAMS" \
   /src_value_iteration/maps/house.pgm \
   /results \
   "$BIN"

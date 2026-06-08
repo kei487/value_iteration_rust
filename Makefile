@@ -187,7 +187,11 @@ compare-ref-report:
 	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
 	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results ref"
 
+# 本家 vs ref を「真の固定点」で bit 比較 (サブステップ精細化まで収束させ stop-sweep 依存を排除)。
+compare-strict:
+	VI_ORIG=$(VI_ORIG) bash scripts/compare_strict.sh
+
 compare-bench: compare-build
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh
 
-.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-bench
+.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-strict compare-bench

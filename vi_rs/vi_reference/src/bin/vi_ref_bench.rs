@@ -144,16 +144,43 @@ fn main() {
 
     // 収束ループ: 本家 bench_client と同じく、各スイープの reported delta (=max_delta>>18) を
     // 監視し、delta<=threshold で converged、max_sweeps で打ち切り。単スレッド order-0。
+    // delta_threshold < 0 → strict モード: 到達可能セル (total_cost < REACH_THRESH) が
+    // 1 スイープで全く変化しなくなる「真の固定点」まで回す。本家の soft 収束 (delta>>18==0)
+    // は確率的アクションのサブステップ精細化を収束後も残すため、bit 一致比較には不向き。
+    // 到達不能セルは overflow-wrap で振動し得るので REACH_THRESH 以上は判定から除外する
+    // (compare.py の到達不能閾値 value>=1e6 と同じ境界)。
+    const REACH_THRESH: u64 = 1_000_000u64 * PROB_BASE; // value < 1e6 step を到達可能とみなす
+    let strict = delta_threshold < 0.0;
     let t0 = Instant::now();
     let mut sweeps: i32 = 0;
     let converged;
-    loop {
-        vi.value_iteration_worker(1, 0);
-        sweeps += 1;
-        let delta = vi.thread_status.get(&0).map(|s| s.delta).unwrap_or(f64::INFINITY);
-        if delta <= delta_threshold || sweeps >= max_sweeps {
-            converged = delta <= delta_threshold;
-            break;
+    if strict {
+        let mut prev: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
+        loop {
+            vi.value_iteration_worker(1, 0);
+            sweeps += 1;
+            let mut changed = false;
+            for (i, s) in vi.states.iter().enumerate() {
+                let tc = s.total_cost;
+                if tc < REACH_THRESH && tc != prev[i] {
+                    changed = true;
+                }
+                prev[i] = tc;
+            }
+            if !changed || sweeps >= max_sweeps {
+                converged = !changed;
+                break;
+            }
+        }
+    } else {
+        loop {
+            vi.value_iteration_worker(1, 0);
+            sweeps += 1;
+            let delta = vi.thread_status.get(&0).map(|s| s.delta).unwrap_or(f64::INFINITY);
+            if delta <= delta_threshold || sweeps >= max_sweeps {
+                converged = delta <= delta_threshold;
+                break;
+            }
         }
     }
     let elapsed = t0.elapsed().as_secs_f64();
@@ -168,7 +195,9 @@ fn main() {
         for ix in 0..nx {
             for it in 0..nt {
                 let s = &vi.states[vi.to_index(ix, iy, it) as usize];
-                value.push(s.total_cost as f64 / PROB_BASE as f64); // ステップ単位 (到達不能≈1e9)
+                // ★本家 valueFunctionWriter は total_cost_/prob_base_ を **整数除算** (uint64/uint64)
+                //   してから float 化する (/value サービス出力)。サブステップの小数は切り捨てられる。
+                value.push((s.total_cost / PROB_BASE) as f64);
                 let pol = match s.optimal_action {
                     Some(ai) => vi.actions[ai].id as f64,
                     None => -1.0,
