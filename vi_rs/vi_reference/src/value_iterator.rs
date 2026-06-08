@@ -10,6 +10,14 @@ use crate::state::State;
 use crate::state_transition::StateTransition;
 use crate::sweep_status::SweepWorkerStatus;
 
+/// `*mut State` をスレッド間共有するためのラッパ。
+/// SAFETY: 本家の non-atomic 共有 `states_` のデータ競合を**忠実再現**するための
+/// 意図的な共有可変。`thread_num>1` は本家同様に非決定的 (技術的 UB、x86 で動く)。
+#[derive(Clone, Copy)]
+struct StatesPtr(*mut State);
+unsafe impl Send for StatesPtr {}
+unsafe impl Sync for StatesPtr {}
+
 pub struct ValueIterator {
     pub states: Vec<State>,
     pub actions: Vec<Action>,
@@ -370,9 +378,68 @@ impl ValueIterator {
         }
     }
 
-    // Task 14 で本実装に差し替える。
+    /// 本家 `valueIterationWorker` をスレッドごとに spawn したマルチスレッド経路。
+    /// 共有 `states` を生ポインタ経由で non-atomic 並行更新する (本家のデータ競合を再現)。
+    /// `status`/`thread_status` は安全側で扱う (バッチ実行では status は不変)。
     fn run_value_iteration_multithread(&mut self, times: i32) {
-        self.value_iteration_worker(times, 0);
+        self.thread_status.clear();
+
+        let n_states = self.states.len();
+        let ptr = StatesPtr(self.states.as_mut_ptr());
+        let cell_num_x = self.cell_num_x;
+        let cell_num_y = self.cell_num_y;
+        let cell_num_t = self.cell_num_t;
+        let thread_num = self.thread_num;
+        let actions = &self.actions;
+        let sweep_orders = &self.sweep_orders;
+        // バッチ実行中は status は不変なので break 条件を bool (Copy) で先に確定し、
+        // 各スレッドクロージャへ move キャプチャする (String を多重 move できないため)。
+        let stop = self.status == "canceled" || self.status == "goal";
+
+        let results: Vec<(i32, SweepWorkerStatus)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..thread_num)
+                .map(|id| {
+                    scope.spawn(move || {
+                        // edition 2021 disjoint capture: force capture of StatesPtr wrapper,
+                        // not ptr.0 field (*mut State which is !Send).
+                        let ptr = ptr;
+                        // SAFETY: 全スレッドが同一バッファを共有。本家のデータ競合を忠実再現。
+                        let states: &mut [State] =
+                            unsafe { std::slice::from_raw_parts_mut(ptr.0, n_states) };
+                        let mut st = SweepWorkerStatus::default();
+                        let order = &sweep_orders[(id as usize) % sweep_orders.len()];
+                        for j in 0..times {
+                            st.sweep_step = j + 1;
+                            let mut max_delta: u64 = 0;
+                            for &si in order.iter() {
+                                let d = value_iteration_raw(
+                                    states,
+                                    actions,
+                                    si as usize,
+                                    cell_num_x,
+                                    cell_num_y,
+                                    cell_num_t,
+                                );
+                                if d > max_delta {
+                                    max_delta = d;
+                                }
+                            }
+                            st.delta = (max_delta >> PROB_BASE_BIT) as f64;
+                            if stop {
+                                break;
+                            }
+                        }
+                        st.finished = true;
+                        (id, st)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (id, st) in results {
+            self.thread_status.insert(id, st);
+        }
     }
 }
 
@@ -897,5 +964,50 @@ mod tests {
         assert_eq!(sweeps.len(), 1);
         assert_eq!(sweeps[0], 3);
         assert!(finish);
+    }
+
+    #[test]
+    fn multithread_converges_close_to_single_thread() {
+        // 同一マップ・ゴールで単スレッド収束値を基準に、マルチスレッドが
+        // 十分スイープ後に同じ固定点へ到達することを確認 (固定点は一意)。
+        let build = |threads: i32| {
+            let mut vi = ValueIterator::new(
+                vec![
+                    Action::new("forward", 0.3, 0.0, 0),
+                    Action::new("back", -0.2, 0.0, 1),
+                    Action::new("left", 0.0, 20.0, 4),
+                ],
+                threads,
+            );
+            let map = free_grid(6, 6);
+            vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+            vi.set_goal(0.1, 0.1, 0);
+            vi
+        };
+
+        let mut single = build(1);
+        single.run_value_iteration(500);
+
+        let mut multi = build(4);
+        multi.run_value_iteration(500);
+
+        // 収束後は同じ固定点。Gauss-Seidel の競合があっても十分回せば一致する
+        // (x86-64 では aligned u64 read/write は tear せず競合は値的に benign)。
+        let s: Vec<u64> = single.states.iter().map(|x| x.total_cost).collect();
+        let m: Vec<u64> = multi.states.iter().map(|x| x.total_cost).collect();
+        assert_eq!(s, m, "multi-thread should reach the same fixed point after enough sweeps");
+    }
+
+    #[test]
+    fn multithread_finished_reports_all_threads() {
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 3);
+        let map = free_grid(4, 4);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        vi.set_goal(0.0, 0.0, 0);
+        vi.run_value_iteration(5);
+        let (sweeps, _d, finish) = vi.finished();
+        assert_eq!(sweeps.len(), 3);
+        assert!(finish);
+        assert!(sweeps.iter().all(|&s| s == 5));
     }
 }
