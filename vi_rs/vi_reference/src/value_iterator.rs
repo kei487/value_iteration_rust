@@ -262,6 +262,56 @@ impl ValueIterator {
             self.cell_num_t,
         )
     }
+
+    /// 本家 `setGoal`。goal_t を [0,360) に正規化し、final_state を再計算。
+    pub fn set_goal(&mut self, goal_x: f64, goal_y: f64, goal_t: i32) {
+        let mut gt = goal_t;
+        while gt < 0 {
+            gt += 360;
+        }
+        while gt >= 360 {
+            gt -= 360;
+        }
+        self.goal_x = goal_x;
+        self.goal_y = goal_y;
+        self.goal_t = gt;
+
+        self.thread_status.clear();
+        self.set_state_values();
+        self.status = "calculating".to_string();
+    }
+
+    /// 本家 `setStateValues`。距離 + 向き判定で final_state を決め、値を初期化。
+    fn set_state_values(&mut self) {
+        let (xy_res, ox, oy) = (self.xy_resolution, self.map_origin_x, self.map_origin_y);
+        let (gx, gy, gt, gm) = (self.goal_x, self.goal_y, self.goal_t, self.goal_margin_theta);
+        let r2 = self.goal_margin_radius * self.goal_margin_radius;
+        let t_res = self.t_resolution;
+
+        for s in self.states.iter_mut() {
+            // 距離判定
+            let x0 = s.ix as f64 * xy_res + ox;
+            let y0 = s.iy as f64 * xy_res + oy;
+            let r0 = (x0 - gx) * (x0 - gx) + (y0 - gy) * (y0 - gy);
+            let x1 = x0 + xy_res;
+            let y1 = y0 + xy_res;
+            let r1 = (x1 - gx) * (x1 - gx) + (y1 - gy) * (y1 - gy);
+            s.final_state = r0 < r2 && r1 < r2 && s.free;
+
+            // 向き判定 (t0/t1 は f64→i32 切り捨て)
+            let t0 = (s.it as f64 * t_res) as i32;
+            let t1 = ((s.it + 1) as f64 * t_res) as i32;
+            let goal_t_2 = if gt > 180 { gt - 360 } else { gt + 360 };
+            let ok = (gt - gm <= t0 && t1 <= gt + gm) || (goal_t_2 - gm <= t0 && t1 <= goal_t_2 + gm);
+            s.final_state = s.final_state && ok;
+        }
+
+        for s in self.states.iter_mut() {
+            s.total_cost = if s.final_state { 0 } else { MAX_COST };
+            s.local_penalty = 0;
+            s.optimal_action = None;
+        }
+    }
 }
 
 // ── コア free 関数 (単スレッド経路とマルチスレッド経路で共有) ──
@@ -710,5 +760,36 @@ mod tests {
         let d = super::value_iteration_raw(&mut states, &actions, 0, 1, 1, nt as i32);
         assert_eq!(d, 0);
         assert_eq!(states[0].total_cost, super::MAX_COST); // 未更新
+    }
+
+    #[test]
+    fn set_goal_normalizes_theta() {
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(3, 3);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        vi.set_goal(0.0, 0.0, -10);
+        assert_eq!(vi.goal_t, 350);
+        vi.set_goal(0.0, 0.0, 370);
+        assert_eq!(vi.goal_t, 10);
+        assert_eq!(vi.status, "calculating");
+    }
+
+    #[test]
+    fn set_state_values_pins_goal_cell() {
+        // goal をグリッド角 (0.5,0.5) に置く。final_state は「セルの両角がゴール半径内」
+        // を要求するため、角を共有する 4 セルの遠い角 (距離 √2*0.05≈0.0707m) を包む
+        // R=0.08 を使う。margin_theta=360 で全θ許容。
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(20, 20); // res=0.05 → 範囲 1.0m
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.08, 360);
+        vi.set_goal(0.5, 0.5, 0); // セル角 (10,10)=(0.5,0.5)
+        // (ix=10,iy=10): 左下角=ゴール(r0=0)、右上角 r1=0.005 < 0.08^2=0.0064 → final。
+        let idx = vi.to_index(10, 10, 0) as usize;
+        assert!(vi.states[idx].final_state);
+        assert_eq!(vi.states[idx].total_cost, 0);
+        // 遠方セル (0,0) は距離 ≫ R → final でない。
+        let far = vi.to_index(0, 0, 0) as usize;
+        assert!(!vi.states[far].final_state);
+        assert_eq!(vi.states[far].total_cost, super::MAX_COST);
     }
 }
