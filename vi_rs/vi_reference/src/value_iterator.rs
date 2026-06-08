@@ -312,6 +312,68 @@ impl ValueIterator {
             s.optimal_action = None;
         }
     }
+
+    /// 本家 `valueIterationWorker`。単スレッド経路 (決定的・テスト基準)。
+    /// `times` 回スイープ。`status` が canceled/goal なら中断。
+    pub fn value_iteration_worker(&mut self, times: i32, id: i32) {
+        self.thread_status.insert(id, SweepWorkerStatus::default());
+        let order_idx = (id as usize) % self.sweep_orders.len();
+
+        for j in 0..times {
+            if let Some(st) = self.thread_status.get_mut(&id) {
+                st.sweep_step = j + 1;
+            }
+            let mut max_delta: u64 = 0;
+            let order_len = self.sweep_orders[order_idx].len();
+            for k in 0..order_len {
+                let i = self.sweep_orders[order_idx][k] as usize;
+                let d = self.value_iteration_at(i);
+                if d > max_delta {
+                    max_delta = d;
+                }
+            }
+            if let Some(st) = self.thread_status.get_mut(&id) {
+                st.delta = (max_delta >> PROB_BASE_BIT) as f64; // ★二重シフト (報告用)
+            }
+            if self.status == "canceled" || self.status == "goal" {
+                break;
+            }
+        }
+        if let Some(st) = self.thread_status.get_mut(&id) {
+            st.finished = true;
+        }
+    }
+
+    /// 本家 `finished`。thread 0..thread_num の状態を集約。
+    /// std::map operator[] の既定挿入を `entry().or_default()` で再現。
+    pub fn finished(&mut self) -> (Vec<u32>, Vec<f64>, bool) {
+        let n = self.thread_num as usize;
+        let mut sweep_times = vec![0u32; n];
+        let mut deltas = vec![0f64; n];
+        let mut finish = true;
+        for t in 0..self.thread_num {
+            let st = self.thread_status.entry(t).or_default();
+            sweep_times[t as usize] = st.sweep_step as u32;
+            deltas[t as usize] = st.delta;
+            finish &= st.finished;
+        }
+        (sweep_times, deltas, finish)
+    }
+
+    /// 価値反復を実行するエントリ。`thread_num<=1` は単スレッド (決定的)。
+    /// `thread_num>1` は Task 14 のマルチスレッド経路を使う。
+    pub fn run_value_iteration(&mut self, times: i32) {
+        if self.thread_num <= 1 {
+            self.value_iteration_worker(times, 0);
+        } else {
+            self.run_value_iteration_multithread(times);
+        }
+    }
+
+    // Task 14 で本実装に差し替える。
+    fn run_value_iteration_multithread(&mut self, times: i32) {
+        self.value_iteration_worker(times, 0);
+    }
 }
 
 // ── コア free 関数 (単スレッド経路とマルチスレッド経路で共有) ──
@@ -791,5 +853,49 @@ mod tests {
         let far = vi.to_index(0, 0, 0) as usize;
         assert!(!vi.states[far].final_state);
         assert_eq!(vi.states[far].total_cost, super::MAX_COST);
+    }
+
+    #[test]
+    fn single_thread_converges_on_small_free_map() {
+        // 5x5 free マップ、goal を中央セルに。十分スイープして goal 隣接が確定する。
+        let mut vi = ValueIterator::new(
+            vec![
+                Action::new("forward", 0.3, 0.0, 0),
+                Action::new("back", -0.2, 0.0, 1),
+                Action::new("right", 0.0, -20.0, 2),
+                Action::new("rightfw", 0.2, -20.0, 3),
+                Action::new("left", 0.0, 20.0, 4),
+                Action::new("leftfw", 0.2, 20.0, 5),
+            ],
+            1,
+        );
+        let map = free_grid(5, 5);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        vi.set_goal(0.1, 0.1, 0); // セル (2,2) 付近
+
+        vi.run_value_iteration(300);
+
+        // 何らかの非 goal セルが MAX_COST 未満 (= 到達可能) になっていること。
+        let reachable = vi.states.iter().any(|s| !s.final_state && s.total_cost < super::MAX_COST);
+        assert!(reachable, "value should propagate from goal");
+
+        // 2 回目の実行で値が変わらない (収束済み) ことを idempotent で確認。
+        let before: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
+        vi.run_value_iteration(50);
+        let after: Vec<u64> = vi.states.iter().map(|s| s.total_cost).collect();
+        assert_eq!(before, after, "converged values must be stable");
+    }
+
+    #[test]
+    fn finished_aggregates_thread_status() {
+        let mut vi = ValueIterator::new(vec![Action::new("f", 0.3, 0.0, 0)], 1);
+        let map = free_grid(3, 3);
+        vi.set_map_with_occupancy_grid(&map, 60, 0.2, 30.0, 0.2, 10);
+        vi.set_goal(0.0, 0.0, 0);
+        vi.value_iteration_worker(3, 0);
+        let (sweeps, _deltas, finish) = vi.finished();
+        assert_eq!(sweeps.len(), 1);
+        assert_eq!(sweeps[0], 3);
+        assert!(finish);
     }
 }
