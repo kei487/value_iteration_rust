@@ -63,6 +63,10 @@ struct Params {
     thread_num: i64,
     map_wait_sec: i64,
     allow_action_mismatch: bool,
+    // Benchmark hook: when non-empty, the action callback dumps the full
+    // value/policy arrays as `.npy` into this directory after the solve
+    // finishes. Empty (default) = off = unchanged production behavior.
+    bench_dump_path: String,
     // Flattened from three parallel arrays (names, fw, rot).
     action_list: Vec<(String, f64, f64)>,
 }
@@ -164,6 +168,16 @@ fn read_params(node: &Node) -> Result<Params> {
         .map_err(|e| anyhow!("declare allow_action_mismatch: {e}"))?
         .get();
 
+    // Benchmark dump directory. String params use `Arc<str>` (no `String`
+    // ParameterVariant impl — see the module docstring); empty default = off.
+    let bench_dump_path = node
+        .declare_parameter::<Arc<str>>("bench_dump_path")
+        .default("".into())
+        .mandatory()
+        .map_err(|e| anyhow!("declare bench_dump_path: {e}"))?
+        .get()
+        .to_string();
+
     // Action list — three parallel arrays instead of list-of-dicts (rclrs
     // does not support nested dict parameters). rclrs array params are
     // `Arc<[Arc<str>]>` / `Arc<[f64]>`; the `default_string_array` and
@@ -226,6 +240,7 @@ fn read_params(node: &Node) -> Result<Params> {
         thread_num,
         map_wait_sec,
         allow_action_mismatch,
+        bench_dump_path,
         action_list,
     })
 }
@@ -527,6 +542,7 @@ fn spawn_action_server(
     let solver_name = params.solver.clone();
     let goal_margin_radius = params.goal_margin_radius;
     let goal_margin_theta_deg = params.goal_margin_theta_deg;
+    let bench_dump_path = params.bench_dump_path.clone();
 
     // node.create_action_server signature (rclrs 0.7 node.rs):
     //   pub fn create_action_server<'a, A: Action, Task>(
@@ -545,6 +561,7 @@ fn spawn_action_server(
             let mut base_ctx = base_ctx.clone_value();
             let grid_meta = grid_meta.clone();
             let solver_name = solver_name.clone();
+            let bench_dump_path = bench_dump_path.clone();
 
             async move {
                 // ── Step 1: cancel any prior in-flight sweep ──────────────────
@@ -620,7 +637,16 @@ fn spawn_action_server(
                     }
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
-                let handle = spawn_sweep(base_ctx, solver, Arc::clone(&cancel), None);
+                // Benchmark hook: allocate a dump slot when bench_dump_path is
+                // set. The worker fills it with the final value/policy arrays
+                // right before it exits; we read it after the worker is joined.
+                let dump_slot: Option<Arc<Mutex<Option<vi_node::sweep_thread::DumpData>>>> =
+                    if bench_dump_path.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(Mutex::new(None)))
+                    };
+                let handle = spawn_sweep(base_ctx, solver, Arc::clone(&cancel), dump_slot.clone());
                 let feedback_rx = handle.feedback_rx.clone();
 
                 // Store handle so publishers can access it and action can cancel.
@@ -705,8 +731,31 @@ fn spawn_action_server(
                 // Await the pump thread's terminal result. If the sender is
                 // dropped without sending (thread panicked), treat as not
                 // finished and abort the goal rather than block forever.
+                //
+                // The pump thread joins the sweep worker (`hnd.join.join()`)
+                // BEFORE sending `done_tx`, and the worker fills `dump_slot`
+                // right before it returns — so once `done_rx.await` completes
+                // the slot is guaranteed populated. Read/write it here.
                 match done_rx.await {
                     Ok(finished) => {
+                        if let Some(slot) = dump_slot {
+                            if let Some(dump) = slot.lock().unwrap().take() {
+                                let vpath = format!("{}/value_ros2.npy", bench_dump_path);
+                                let ppath = format!("{}/policy_ros2.npy", bench_dump_path);
+                                if let Err(e) = vi_node::npy::write_u16(&vpath, &dump.value) {
+                                    eprintln!("ERROR: write {vpath}: {e}");
+                                }
+                                if let Err(e) = vi_node::npy::write_i16(&ppath, &dump.policy) {
+                                    eprintln!("ERROR: write {ppath}: {e}");
+                                }
+                                eprintln!("bench dump written to {bench_dump_path}");
+                            } else {
+                                eprintln!(
+                                    "WARN: bench_dump_path set but dump slot was empty \
+                                     (sweep cancelled before completion?)"
+                                );
+                            }
+                        }
                         executing.succeeded_with(vi_interfaces::action::Vi_Result { finished })
                     }
                     Err(_) => {
