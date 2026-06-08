@@ -238,6 +238,30 @@ impl ValueIterator {
         let o1_second: Vec<i32> = self.sweep_orders[1][half..].to_vec();
         self.sweep_orders[4].extend(o1_second); // [4] = [0]全体 + [1]後半
     }
+
+    /// 本家 `actionCost`。
+    pub fn action_cost(&self, s: &State, a: &Action) -> u64 {
+        action_cost_raw(
+            &self.states,
+            a,
+            s,
+            self.cell_num_x,
+            self.cell_num_y,
+            self.cell_num_t,
+        )
+    }
+
+    /// 本家 `valueIteration` (states[idx] を更新)。
+    pub fn value_iteration_at(&mut self, idx: usize) -> u64 {
+        value_iteration_raw(
+            &mut self.states,
+            &self.actions,
+            idx,
+            self.cell_num_x,
+            self.cell_num_y,
+            self.cell_num_t,
+        )
+    }
 }
 
 // ── コア free 関数 (単スレッド経路とマルチスレッド経路で共有) ──
@@ -331,6 +355,73 @@ pub(crate) fn compute_theta_transitions(
         oy += xy_step;
     }
     out
+}
+
+/// 本家 `actionCost`。★u64 オーバーフロー折り返しを `wrapping_*` で再現。
+/// `dit` は絶対 θ なので `(dit + nt) % nt` で wrap (s.it は足さない)。
+pub(crate) fn action_cost_raw(
+    states: &[State],
+    a: &Action,
+    s: &State,
+    cell_num_x: i32,
+    cell_num_y: i32,
+    cell_num_t: i32,
+) -> u64 {
+    let mut cost: u64 = 0;
+    for tran in &a.state_transitions[s.it as usize] {
+        let ix = s.ix + tran.dix;
+        if ix < 0 || ix >= cell_num_x {
+            return MAX_COST;
+        }
+        let iy = s.iy + tran.diy;
+        if iy < 0 || iy >= cell_num_y {
+            return MAX_COST;
+        }
+        let it = (tran.dit + cell_num_t) % cell_num_t;
+        let after = &states[to_index_raw(ix, iy, it, cell_num_x, cell_num_t) as usize];
+        if !after.free {
+            return MAX_COST;
+        }
+        cost = cost.wrapping_add(
+            after
+                .total_cost
+                .wrapping_add(after.penalty)
+                .wrapping_add(after.local_penalty)
+                .wrapping_mul(tran.prob as u64),
+        );
+    }
+    cost >> PROB_BASE_BIT
+}
+
+/// 本家 `valueIteration`。free でない/final_state なら 0 を返し更新しない。
+pub(crate) fn value_iteration_raw(
+    states: &mut [State],
+    actions: &[Action],
+    idx: usize,
+    cell_num_x: i32,
+    cell_num_y: i32,
+    cell_num_t: i32,
+) -> u64 {
+    if !states[idx].free || states[idx].final_state {
+        return 0;
+    }
+    let mut min_cost: u64 = MAX_COST;
+    let mut min_action: Option<usize> = None;
+    {
+        let s = &states[idx];
+        for (ai, a) in actions.iter().enumerate() {
+            let c = action_cost_raw(states, a, s, cell_num_x, cell_num_y, cell_num_t);
+            if c < min_cost {
+                min_cost = c;
+                min_action = Some(ai);
+            }
+        }
+    }
+    let old = states[idx].total_cost;
+    let delta = (min_cost as i64) - (old as i64);
+    states[idx].total_cost = min_cost;
+    states[idx].optimal_action = min_action;
+    delta.unsigned_abs()
 }
 
 #[cfg(test)]
@@ -500,5 +591,124 @@ mod tests {
         let list = compute_theta_transitions(0.0, 20.0, 5, 0.05, 6.0);
         let top = list.iter().max_by_key(|s| s.prob).unwrap();
         assert_eq!(top.dit, 8, "θ_origin30 + rot20 = 50° → index 8 (絶対)");
+    }
+
+    fn mk_state(ix: i32, iy: i32, it: i32, free: bool, total: u64, penalty: u64) -> State {
+        State {
+            total_cost: total,
+            penalty,
+            local_penalty: 0,
+            ix,
+            iy,
+            it,
+            free,
+            final_state: false,
+            optimal_action: None,
+        }
+    }
+
+    fn single_action(dix: i32, diy: i32, dit: i32, nt: usize) -> Action {
+        let mut a = Action::new("a", 0.0, 0.0, 0);
+        a.state_transitions = vec![Vec::new(); nt];
+        for it in 0..nt {
+            a.state_transitions[it].push(StateTransition::new(dix, diy, dit, super::PROB_BASE as i32));
+        }
+        a
+    }
+
+    #[test]
+    fn action_cost_deterministic_neighbor() {
+        // 2x1 マップ、θ=0。dix=+1 で隣 (free, total=5*PROB_BASE, penalty=PROB_BASE)。
+        // cost = (5*PB + PB)*PB >>18 = 6*PB。
+        let nt = 1usize;
+        let nx = 2;
+        let ny = 1;
+        let states = vec![
+            mk_state(0, 0, 0, true, super::MAX_COST, super::PROB_BASE),
+            mk_state(1, 0, 0, true, 5 * super::PROB_BASE, super::PROB_BASE),
+        ];
+        let a = single_action(1, 0, 0, nt);
+        let s = states[0].clone();
+        let c = super::action_cost_raw(&states, &a, &s, nx, ny, nt as i32);
+        assert_eq!(c, 6 * super::PROB_BASE);
+    }
+
+    #[test]
+    fn action_cost_out_of_map_returns_max() {
+        let nt = 1usize;
+        let states = vec![mk_state(0, 0, 0, true, 0, 0)];
+        let a = single_action(-1, 0, 0, nt); // dix=-1 → 範囲外
+        let s = states[0].clone();
+        let c = super::action_cost_raw(&states, &a, &s, 1, 1, nt as i32);
+        assert_eq!(c, super::MAX_COST);
+    }
+
+    #[test]
+    fn action_cost_obstacle_neighbor_returns_max() {
+        let nt = 1usize;
+        let states = vec![
+            mk_state(0, 0, 0, true, 0, 0),
+            mk_state(1, 0, 0, false, 0, 0), // not free
+        ];
+        let a = single_action(1, 0, 0, nt);
+        let s = states[0].clone();
+        let c = super::action_cost_raw(&states, &a, &s, 2, 1, nt as i32);
+        assert_eq!(c, super::MAX_COST);
+    }
+
+    #[test]
+    fn action_cost_overflow_wraps() {
+        // 未到達 free 隣接 (total=MAX_COST) → MAX_COST*PROB_BASE が u64 を折り返す。
+        // 期待値: (MAX_COST + PROB_BASE) を PROB_BASE 倍して wrap し >>18。
+        let nt = 1usize;
+        let penalty = super::PROB_BASE;
+        let states = vec![
+            mk_state(0, 0, 0, true, super::MAX_COST, penalty),
+            mk_state(1, 0, 0, true, super::MAX_COST, penalty),
+        ];
+        let a = single_action(1, 0, 0, nt);
+        let s = states[0].clone();
+        let c = super::action_cost_raw(&states, &a, &s, 2, 1, nt as i32);
+        // 手計算: term = (MAX_COST + PROB_BASE) wrapping_mul PROB_BASE; result = term >> 18。
+        let term = (super::MAX_COST.wrapping_add(penalty)).wrapping_mul(super::PROB_BASE);
+        let expected = term >> super::PROB_BASE_BIT;
+        assert_eq!(c, expected);
+        // 折り返しにより MAX_COST 未満になることを確認 (固有挙動)。
+        assert!(c < super::MAX_COST, "overflow wrap should yield value < MAX_COST, got {c}");
+    }
+
+    #[test]
+    fn value_iteration_picks_min_and_records_action() {
+        // 3x1 マップ θ=0。中央 (idx=1) から action0:dix=+1(隣 total=9), action1:dix=-1(隣 total=4)。
+        let nt = 1usize;
+        let nx = 3;
+        let ny = 1;
+        let mut states = vec![
+            mk_state(0, 0, 0, true, 4 * super::PROB_BASE, super::PROB_BASE),
+            mk_state(1, 0, 0, true, super::MAX_COST, super::PROB_BASE),
+            mk_state(2, 0, 0, true, 9 * super::PROB_BASE, super::PROB_BASE),
+        ];
+        let a0 = single_action(1, 0, 0, nt); // → 右 (total=9)
+        let a1 = single_action(-1, 0, 0, nt); // → 左 (total=4)
+        let actions = vec![a0, a1];
+        let mid = 1usize;
+        let d = super::value_iteration_raw(&mut states, &actions, mid, nx, ny, nt as i32);
+        // 左 (4*PB + PB)*PB >>18 = 5*PB。右 = 10*PB。min = 5*PB、action1。
+        assert_eq!(states[mid].total_cost, 5 * super::PROB_BASE);
+        assert_eq!(states[mid].optimal_action, Some(1));
+        // delta = |5*PB - MAX_COST|
+        assert_eq!(d, super::MAX_COST - 5 * super::PROB_BASE);
+    }
+
+    #[test]
+    fn value_iteration_skips_final_and_obstacle() {
+        let nt = 1usize;
+        let mut s_final = mk_state(0, 0, 0, true, super::MAX_COST, super::PROB_BASE);
+        s_final.final_state = true;
+        let mut states = vec![s_final];
+        let actions: Vec<Action> = vec![single_action(1, 0, 0, nt)];
+        let d = super::value_iteration_raw(&mut states, &actions, 0, 1, 1, nt as i32);
+        assert_eq!(d, 0);
+        assert_eq!(states[0].total_cost, super::MAX_COST); // 未更新
     }
 }
