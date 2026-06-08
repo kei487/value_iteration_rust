@@ -121,6 +121,7 @@ clean:
 # ----- vi_ros2 (ROS2 Humble + ros2_rust) ------------------------------
 
 VI_ROS2_DOCKER_IMG ?= vi_ros2_dev:humble
+VI_COMPARE_ROS1_IMG ?= vi_compare_ros1:noetic
 
 ros2-docker:
 	docker build -t $(VI_ROS2_DOCKER_IMG) vi_ros2/docker
@@ -152,23 +153,23 @@ ros2-test:
 VI_ORIG ?= $(abspath $(PWD)/../value_iteration)
 
 compare-build: ros2-docker
-	docker build -t vi_compare_ros1:noetic -f vi_compare/docker/Dockerfile.ros1 vi_compare/docker
+	docker build -t $(VI_COMPARE_ROS1_IMG) -f vi_compare/docker/Dockerfile.ros1 vi_compare/docker
 
 compare-ros1:
 	docker run --rm \
 	  -v $(VI_ORIG):/src_value_iteration:ro \
 	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  vi_compare_ros1:noetic bash /workspace/vi_compare/ros1/run_ros1_bench.sh
+	  $(VI_COMPARE_ROS1_IMG) bash /workspace/vi_compare/ros1/run_ros1_bench.sh
 
 compare-ros2:
 	docker run --rm \
 	  -v $(VI_ORIG):/src_value_iteration:ro \
 	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  vi_ros2_dev:humble bash /workspace/vi_compare/ros2/run_ros2_bench.sh
+	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/ros2/run_ros2_bench.sh
 
 compare-report:
 	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
-	  vi_compare_ros1:noetic bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results"
+	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results"
 
 compare-bench: compare-build
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh

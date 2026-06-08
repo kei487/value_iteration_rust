@@ -40,7 +40,8 @@ class Bench:
 
     def run(self, gx, gy, gyaw_deg):
         rospy.loginfo("waiting for action server /vi_controller ...")
-        self.client.wait_for_server()
+        if not self.client.wait_for_server(rospy.Duration(120)):
+            raise RuntimeError('vi_controller action server not available')
         goal = ViGoal()
         ps = PoseStamped()
         ps.header.frame_id = 'map'

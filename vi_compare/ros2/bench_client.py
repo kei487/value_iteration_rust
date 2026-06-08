@@ -23,20 +23,33 @@ def load_pgm(path):
         data = np.frombuffer(f.read(w * h), dtype=np.uint8).reshape((h, w))
     return w, h, data
 
-def to_occupancy(w, h, pgm, resolution, ox, oy):
-    # map_server semantics: pixel 0(black)=occupied(100), 255(white)=free(0).
-    # ROS data is row-major bottom-up (origin bottom-left) => flip vertically.
-    occ = np.full((h, w), -1, dtype=np.int8)
-    free = pgm > int(0.65 * 255)   # > free thresh -> free
-    occ[free] = 0
-    occ[pgm < int(0.196 * 255)] = 100  # occupied
+def load_map_yaml(pgm_path):
+    """Read the sibling <map>.yaml (map_server format) for geometry + thresholds."""
+    yaml_path = os.path.splitext(pgm_path)[0] + '.yaml'
+    with open(yaml_path) as f:
+        m = yaml.safe_load(f)
+    origin = m.get('origin', [0.0, 0.0, 0.0])
+    return dict(resolution=float(m['resolution']),
+                ox=float(origin[0]), oy=float(origin[1]),
+                occupied_thresh=float(m.get('occupied_thresh', 0.65)),
+                free_thresh=float(m.get('free_thresh', 0.196)),
+                negate=int(m.get('negate', 0)))
+
+def to_occupancy(w, h, pgm, meta):
+    # map_server semantics (negate=0): occ_prob = (255 - p)/255
+    p = pgm.astype(np.float64)
+    occ_prob = (p / 255.0) if meta['negate'] else ((255.0 - p) / 255.0)
+    occ = np.full((h, w), -1, dtype=np.int8)              # default: unknown
+    occ[occ_prob < meta['free_thresh']] = 0               # free
+    occ[occ_prob > meta['occupied_thresh']] = 100         # occupied
+    # ROS OccupancyGrid is row-major bottom-up (origin bottom-left) -> flip vertically
     occ = np.flipud(occ)
     msg = OccupancyGrid()
-    msg.info.resolution = resolution
+    msg.info.resolution = meta['resolution']
     msg.info.width = w
     msg.info.height = h
-    msg.info.origin.position.x = ox
-    msg.info.origin.position.y = oy
+    msg.info.origin.position.x = meta['ox']
+    msg.info.origin.position.y = meta['oy']
     msg.info.origin.orientation.w = 1.0
     msg.data = occ.reshape(-1).tolist()
     return msg
@@ -58,7 +71,8 @@ class BenchNode(Node):
 
     def send(self):
         g = self.p['goal']
-        self.ac.wait_for_server()
+        if not self.ac.wait_for_server(timeout_sec=120):
+            raise RuntimeError('vi_controller action server not available')
         goal = Vi.Goal()
         ps = PoseStamped()
         ps.header.frame_id = 'map'
@@ -89,7 +103,8 @@ def main():
     with open(params_path) as f:
         p = yaml.safe_load(f)
     w, h, pgm = load_pgm(map_path)
-    map_msg = to_occupancy(w, h, pgm, 0.05, -10.0, -10.0)
+    meta = load_map_yaml(map_path)
+    map_msg = to_occupancy(w, h, pgm, meta)
     rclpy.init()
     node = BenchNode(p, map_msg)
     node.send()
