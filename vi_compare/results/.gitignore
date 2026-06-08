@@ -1,4 +1,5 @@
 *.npy
 *.json
-report.md
+*.raw
+report*.md
 !.gitkeep

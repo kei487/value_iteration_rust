@@ -173,7 +173,21 @@ compare-report:
 	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
 	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results"
 
+# vi_reference (本家 u64 忠実移植) を vi_ros2_dev イメージ内でビルド・実行して
+# value_ref.npy 等を生成 (ROS 非依存・cargo のみ)。
+compare-ref:
+	mkdir -p $(PWD)/vi_compare/results
+	docker run --rm \
+	  -v $(VI_ORIG):/src_value_iteration:ro \
+	  -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  $(VI_ROS2_DOCKER_IMG) bash /workspace/vi_compare/ref/run_ref_bench.sh
+
+# 本家(ros1) vs ref の比較レポート (report_ref.md)。既存の value_ros1.npy を使う。
+compare-ref-report:
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 compare.py /results ref"
+
 compare-bench: compare-build
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh
 
-.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-bench
+.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-bench
