@@ -1006,6 +1006,9 @@ dependencies = [
 [[package]]
 name = "vi_reference"
 version = "0.1.0"
+dependencies = [
+ "vi_algorithm",
+]
 
 [[package]]
 name = "wait-timeout"
