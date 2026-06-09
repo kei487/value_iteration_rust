@@ -216,6 +216,11 @@ compare-u64-report:
 	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
 	  $(VI_COMPARE_ROS1_IMG) bash -lc 'cd /workspace/vi_compare/compare && for s in $(SIDES); do python3 compare.py /results $$s; done'
 
+# 全 u64 ソルバ vs 本家の一覧レポート report_u64.md (bit-exact & 速度) を生成。
+compare-u64-summary:
+	docker run --rm -v $(PWD):/workspace -v $(PWD)/vi_compare/results:/results \
+	  $(VI_COMPARE_ROS1_IMG) bash -lc "cd /workspace/vi_compare/compare && python3 make_u64_report.py /results"
+
 # 本家 vs ref を「真の固定点」で bit 比較 (サブステップ精細化まで収束させ stop-sweep 依存を排除)。
 compare-strict:
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_strict.sh
@@ -223,4 +228,4 @@ compare-strict:
 compare-bench: compare-build
 	VI_ORIG=$(VI_ORIG) bash scripts/compare_bench.sh
 
-.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-f3d compare-f3d-report compare-u64 compare-u64-report compare-strict compare-bench
+.PHONY: compare-build compare-ros1 compare-ros2 compare-report compare-ref compare-ref-report compare-f3d compare-f3d-report compare-u64 compare-u64-report compare-u64-summary compare-strict compare-bench
