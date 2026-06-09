@@ -39,25 +39,37 @@ fn update_block(
 
 /// セット済み `ValueIterator` を BlockRefine で収束まで解く。`(iters, updates, converged)` を返す。
 pub fn block_refine_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
+    block_refine_sized(vi, BLOCK, LOCAL_SWEEPS, max_iter)
+}
+
+/// ブロックサイズ・inner sweep 数を指定した BlockRefine 一回分。PyramidSweep が
+/// 粗→細のスケジュールで再利用する。値は MAX_COST から単調降下するのでブロックサイズに
+/// 依らず固定点は不変（bit-exact）。
+pub(crate) fn block_refine_sized(
+    vi: &mut ValueIterator,
+    block: i32,
+    local_sweeps: u32,
+    max_iter: u32,
+) -> (u32, u64, bool) {
     let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
     // i32::div_ceil は unstable なので手動 (nx,ny,mx,my は非負)。
     let ceil_div = |a: i32, b: i32| (a + b - 1) / b;
-    let n_bx = ceil_div(nx, BLOCK);
-    let n_by = ceil_div(ny, BLOCK);
+    let n_bx = ceil_div(nx, block);
+    let n_by = ceil_div(ny, block);
     let nb = (n_bx * n_by) as usize;
     let bidx = |bx: i32, by: i32| -> usize { (by * n_bx + bx) as usize };
 
     // ブロック膨張半径 (mx/my をブロック単位に換算)。
     let (mx, my, _mt) = super::displacement(vi);
-    let rx = ceil_div(mx, BLOCK);
-    let ry = ceil_div(my, BLOCK);
+    let rx = ceil_div(mx, block);
+    let ry = ceil_div(my, block);
 
     // passable ブロック: free セルを含むブロック。
     let mut passable = vec![false; nb];
     // 種ブロック: goal (total_cost<MAX_COST) を含むブロック。
     let mut frontier = vec![false; nb];
     for s in &vi.states {
-        let b = bidx(s.ix / BLOCK, s.iy / BLOCK);
+        let b = bidx(s.ix / block, s.iy / block);
         if s.free {
             passable[b] = true;
         }
@@ -108,15 +120,15 @@ pub fn block_refine_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, b
         let mut next = vec![false; nb];
         let mut any_changed = false;
         for by in 0..n_by {
-            let y0 = by * BLOCK;
-            let y1 = ((by + 1) * BLOCK).min(ny) - 1;
+            let y0 = by * block;
+            let y1 = ((by + 1) * block).min(ny) - 1;
             for bx in 0..n_bx {
                 if !active[bidx(bx, by)] {
                     continue;
                 }
-                let x0 = bx * BLOCK;
-                let x1 = ((bx + 1) * BLOCK).min(nx) - 1;
-                let (u, changed) = update_block(vi, x0, x1, y0, y1, nx, ny, nt, LOCAL_SWEEPS);
+                let x0 = bx * block;
+                let x1 = ((bx + 1) * block).min(nx) - 1;
+                let (u, changed) = update_block(vi, x0, x1, y0, y1, nx, ny, nt, local_sweeps);
                 updates += u;
                 if changed {
                     next[bidx(bx, by)] = true;
