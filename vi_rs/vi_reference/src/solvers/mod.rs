@@ -6,6 +6,8 @@
 use crate::params::MAX_COST;
 use crate::value_iterator::ValueIterator;
 
+pub mod frontier3d;
+
 /// dilation 変位 `(mx, my, mt)` を `actions` の全遷移から算出する。`dit` は絶対 θ なので、
 /// 各 (action, source theta `t`) について循環距離 `min(|dit-t|, nt-|dit-t|)` を取り `mt` とする。
 /// これは「あるセルが変化したとき再評価が必要な前駆セル集合」の正しい上位集合を与える。
