@@ -29,8 +29,8 @@ thiserror          = "1"
 futures            = "0.3"
 
 vi_core      = { path = "../../vi_rs/vi_core" }
-vi_algorithm = { path = "../../vi_rs/vi_algorithm" }
-vi_fixtures  = { path = "../../vi_rs/vi_fixtures" }
+# u64 (本家忠実) ソルバ群 + ValueIterator。u16 の vi_algorithm/vi_fixtures から移行。
+vi_reference = { path = "../../vi_rs/vi_reference" }
 
 # ROS deps. colcon-ros-cargo generates a `.cargo/config.toml` that
 # `[patch.crates-io]`-redirects these to the locally-built crates (rclrs 0.7.0
@@ -50,7 +50,9 @@ rayon = { version = "1.10", optional = true }
 [features]
 default     = ["parallel"]
 online      = []
-parallel    = ["vi_algorithm/parallel", "dep:rayon"]
+# u64 ソルバはシリアル。rayon プールは vestigial（init_rayon のみ）だが、ROS パラメータ
+# thread_num との互換のためフラグは残す。
+parallel    = ["dep:rayon"]
 integration = []
 
 [dev-dependencies]

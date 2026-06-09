@@ -8,3 +8,9 @@ pub mod bridge;
 pub mod npy;
 pub mod solver_factory;
 pub mod sweep_thread;
+
+// Oracle-equivalence tests live in the library (run via `cargo test --lib`) so
+// they don't force cargo to build the rclrs `vi_node` binary (which links only
+// via colcon). See `oracle.rs`.
+#[cfg(test)]
+mod oracle;

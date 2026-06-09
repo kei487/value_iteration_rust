@@ -10,17 +10,16 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Bridge / solver_factory / sweep_thread unit tests (no ROS deps).
+# Library unit tests (no ROS deps): bridge / solver_factory / sweep_thread plus
+# the oracle-equivalence tests (now library-internal — see src/oracle.rs). They
+# run under `--lib` so cargo does NOT build the rclrs `vi_node` binary, which
+# links only via colcon (a plain `cargo test --test ...` would fail to find the
+# vi_interfaces C typesupport libs). Run both feature flavors.
 cd "$REPO_ROOT/vi_ros2/vi_node"
 cargo test --lib --no-default-features
 cargo test --lib
 
-# Oracle equivalence in serial mode (only runs under --no-default-features).
-cargo test --test oracle_equivalence --no-default-features
-
-# Full colcon build, then colcon test.
+# Full colcon build (this is what links the rclrs `vi_node` binary; plain cargo
+# cannot link the vi_interfaces C typesupport libs outside colcon).
 cd "$REPO_ROOT"
 bash scripts/ros2_build.sh
-cd "$REPO_ROOT/vi_ros2_ws"
-colcon test --packages-select vi_node
-colcon test-result --verbose

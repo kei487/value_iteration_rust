@@ -52,6 +52,21 @@ pub fn write_i16(path: &str, arr: &Array3<i16>) -> io::Result<()> {
     f.write_all(&bytes)
 }
 
+/// `.npy` writer for `Array3<f64>` (`<f8`, C order). Used by the u64 node bench
+/// dump: value = `total_cost / PROB_BASE`, policy = action id (-1 if none),
+/// matching `vi_reference`'s `vi_u64_bench` output so the vi_compare pipeline can
+/// read the `ros2` side identically to the other u64 sides.
+pub fn write_f64(path: &str, arr: &Array3<f64>) -> io::Result<()> {
+    let std = arr.as_standard_layout();
+    let mut f = File::create(path)?;
+    write_header(&mut f, "<f8", std.shape())?;
+    let mut bytes = Vec::with_capacity(std.len() * 8);
+    for &v in std.iter() {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    f.write_all(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
