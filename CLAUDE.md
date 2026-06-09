@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-FPGA accelerator for 3D (x, y, theta) Value Iteration path planning, targeting Ultra96-V2 (Zynq UltraScale+ ZU3EG). Goal: solve a 14000×800×60 campus map in <60 s. The same VI algorithm is realized in several coordinated implementations that share a single 16-bit data contract:
+FPGA accelerator for 3D (x, y, theta) Value Iteration path planning, targeting Ultra96-V2 (Zynq UltraScale+ ZU3EG). Goal: solve a 14000×800×60 campus map in <60 s. The same VI algorithm is realized in several coordinated implementations that share a single 16-bit data contract, plus a faithful u64 reference model (`vi_rs/vi_reference`) mirroring the ROS1 original:
 
 - **`vi_fpga/`** — the Vitis HLS kernel (`vi_sweep`), its Linux user-space driver (UIO + u-dma-buf), a C CLI, a host-side reference solver, and the Petalinux/board bring-up. This is the hardware vertical.
 - **`vi_matlab/`** — a MATLAB HDL Coder variant of the streaming kernel plus algorithm experiments/benchmarks; mirrors the streaming HLS kernel.
-- **`vi_rs/`** — a Rust Cargo workspace porting the MATLAB/C algorithms (reference, frontier, block, pyramid, stream-mimic) for a fast CPU baseline, a bit-exact regression oracle, and a benchmark harness.
-- **`vi_ros2/`** — a ROS2 (Humble) Rust node that calls `vi_rs` to serve goals, build penalty fields from `OccupancyGrid`, and publish value/policy maps. **In progress** — ROS deps are not yet wired (see below).
+- **`vi_rs/`** — a Rust Cargo workspace with two coordinated VI models: the 16-bit HLS data contract (`vi_core` + the `vi_algorithm` bitboard primitives) and a faithful u64 port of the ROS1 `value_iteration` node (`vi_reference`). The fast CPU solvers (reference, frontier, block, pyramid, stream-mimic) live in `vi_reference::solvers` — u64, bit-exact with the ROS1 original — and `vi_bench` is the benchmark harness.
+- **`vi_ros2/`** — a ROS2 (Humble) Rust node (`vi_node`) that calls `vi_rs` (the u64 `vi_reference` solvers) to serve goals, builds the penalty field + goal mask inside `ValueIterator`, and publishes value/policy maps. rclrs is wired; the node builds via colcon in the Docker image.
 
 Phase plan and design specs live in `docs/superpowers/specs/` and `docs/superpowers/plans/` — read them before making non-trivial changes to algorithms, datatypes, or memory layout. Specs are written in Japanese.
 
@@ -40,15 +40,15 @@ Tools must be on `PATH` — invoke bare `vitis-run` / `vivado` (Vitis 2025.2). D
 
 ### Rust workspace (`vi_rs/`)
 
-A 4-crate Cargo workspace (`vi_core`, `vi_algorithm`, `vi_fixtures`, `vi_bench`) plus a standalone `vi_ml/` crate that is **deliberately not a workspace member** (use undefined; left untouched). Driven from the repo-root Makefile (these targets are current):
+A 5-crate Cargo workspace (`vi_core`, `vi_algorithm`, `vi_reference`, `vi_fixtures`, `vi_bench`) plus a standalone `vi_ml/` crate that is **deliberately not a workspace member** (use undefined; left untouched). `vi_fixtures` (synthetic u16 maps/transitions) is now orphaned — its only consumers were the u16 solvers, removed in the u64 migration. Driven from the repo-root Makefile (these targets are current):
 
 - `make rs-test` — `cd vi_rs && cargo test --workspace`.
-- `make rs-bench` — criterion microbenchmarks (`cargo bench -p vi_bench`).
-- `make rs-bench-summary` — `bench_summary` CLI: a `benchmark_vi.m`-compatible macro comparison table across sizes/map-types, emits CSV/markdown.
-- `make rs-bench-parallel` — same, with the `parallel` Cargo feature (rayon) enabled.
-- Run a single crate's tests: `cd vi_rs && cargo test -p vi_algorithm`.
+- `make rs-bench` — criterion microbenchmarks (`cargo bench -p vi_bench`) over the u64 `vi_reference` solvers (the `bitboard` microbench still exercises `vi_algorithm`).
+- `make rs-bench-summary` — `bench_summary` CLI: a `benchmark_vi.m`-compatible macro comparison table across sizes/map-types over every u64 solver, emits CSV/markdown. Each solver is bit-exact with the ROS1 original (mismatch=0 vs the Reference oracle).
+- `make rs-bench-parallel` — same; retained for `make`-target compatibility but a no-op (the u64 solvers are serial-only).
+- Run a single crate's tests: `cd vi_rs && cargo test -p vi_reference`.
 
-The `parallel` feature (off by default) gates rayon. The serial build is the bit-exact oracle; the parallel build is the practical optimized variant.
+The u64 solvers in `vi_reference` are the bit-exact regression oracle; there is no parallel CPU path yet (the old `vi_algorithm` rayon `parallel` feature was dropped with the u16 solvers).
 
 ### MATLAB kernel (`vi_matlab/`)
 
@@ -62,9 +62,9 @@ Requires MATLAB R2024b+ with HDL Coder, HDL Verifier, Fixed-Point Designer, SoC 
 
 The MATLAB kernel is a variant alongside tile and stream HLS kernels. Algorithm functions in `vi_matlab/src/` mirror the streaming HLS kernel (`vi_fpga/hls/stream/src/`). Constants in `vi_params.m` must stay synchronized with `vi_stream_types.h`.
 
-### ROS2 node (`vi_ros2/`) — in progress
+### ROS2 node (`vi_ros2/`)
 
-ROS2 Humble Rust node, built via `colcon` + `cargo-ament-build` inside a Docker image. Driven from the repo root:
+ROS2 Humble Rust node, built via `colcon` + `cargo-ament-build` inside a Docker image. Runs the u64 `vi_reference` solvers; interface-equivalent to the ROS1 node and builds/links via colcon (the tf2-based robot-pose lookup for `cmd_vel` is still a `(0,0,0)` stub). Driven from the repo root:
 
 - `make ros2-docker` — build the dev image (`vi_ros2/docker/Dockerfile`), tag `vi_ros2_dev:humble` (override `VI_ROS2_DOCKER_IMG`).
 - `make ros2-shell` — interactive shell in the image with the repo mounted at `/workspace`.
@@ -73,8 +73,8 @@ ROS2 Humble Rust node, built via `colcon` + `cargo-ament-build` inside a Docker 
 Two packages:
 
 - `vi_interfaces/` — ament_cmake package defining `action/Vi.action` only; `rosidl_generator_rs` emits Rust types for rclrs.
-- `vi_node/` — the rclrs node. **`vi_node` is deliberately outside the `vi_rs` Cargo workspace** (its `Cargo.toml` has an explicit empty `[workspace]`) so its `path = "../../vi_rs/*"` deps don't pull it into that workspace. ROS deps (`rclrs`, `nav_msgs`, etc.) are currently **commented out** — `main.rs` is kept ROS-free so `cargo check` works on the host until the Docker image exposes rclrs via colcon.
-- `vi_node::bridge` is intentionally rclrs-free and unit-testable today: `cd vi_ros2/vi_node && cargo test -p vi_node --lib`.
+- `vi_node/` — the rclrs node, built on the u64 `vi_reference::ValueIterator` + `solvers::solve`. **`vi_node` is deliberately outside the `vi_rs` Cargo workspace** (its `Cargo.toml` has an explicit empty `[workspace]`) so its `path = "../../vi_rs/*"` deps don't pull it into that workspace. `rclrs`/`nav_msgs`/`vi_interfaces` are wired as `*` deps and `[patch.crates-io]`-redirected (repo `.cargo/config.toml`) to colcon-built crates; the **binary links only via colcon** (`make ros2-build`), not plain `cargo build`.
+- The rclrs-free library (`bridge`/`npy`/`solver_factory`/`sweep_thread` + the `oracle` equivalence tests) runs via `cargo test --lib` **inside the Docker image**; on the host it is checkable via a `/tmp` isolation crate that `#[path]`-includes those modules (the repo `.cargo/config.toml` ROS patches block a plain host build). A plain `cargo test --test ...` does NOT work — it forces cargo to build the rclrs binary, which only links under colcon (so the oracle tests live in the library, not `tests/`).
 
 The external ROS interface is **interface-equivalent** to the ROS1 `value_iteration` catkin package (action name `vi_controller`, `/map` in, `value_function`/`policy`/`cmd_vel` out) but uses ROS2-native message types. See `docs/superpowers/specs/2026-05-29-vi-ros2-design.md`.
 
@@ -118,10 +118,11 @@ Register offsets come from the HLS-generated `xvi_sweep_hw.h`; never hand-edit `
 `create_bd_*.tcl` / `create_project_*.tcl` (in `vi_fpga/tcl/`) build the Vivado block design wrapping two `vi_sweep` CUs with AXI and interrupts. `vi_fpga/pynq/` holds bitstream + hwh + a PYNQ-side overlay helper for pre-Linux-driver experimentation on Ultra96-V2.
 
 ### 5. Rust algorithm port (`vi_rs/`)
-- `vi_core` — the immutable data contract: `types`, algorithm constants (`params`: `PENALTY_OBSTACLE`/`PENALTY_GOAL`/`STEP_COST`/`N_THETA`/…), the bit-exact `cost_of`, packed↔unpacked transition conversion (`transitions`), and `make_goal_mask` (`goal`). Mirrors the HLS/C/MATLAB contract.
-- `vi_algorithm` — a uniform `Solver` trait operating on a shared `VIContext` (`value: Array3` updated in place; `penalty`/`goal_mask`/`transitions`/`dims` read-only). Variants: `Reference`, the `Frontier2D/3D{,CoarseTheta,Tau,TopK}` + `FrontierStack` family, `BlockRefine`, `PyramidSweep`, and `StreamMimic`; plus a `bitboard` submodule used by the frontier solvers. The `parallel` feature adds rayon. Solvers run to convergence or until a `Budget` (`Sweeps`/`Iterations`) is exhausted, returning `SolveStats`.
-- `vi_fixtures` — `gen_test_map` / `gen_transitions` equivalents; a normal dep of `vi_bench`, a dev-dep of `vi_algorithm` (tests only). Production code stays `vi_core + vi_algorithm` only.
-- `vi_bench` — criterion benches + the `bench_summary` CLI.
+- `vi_core` — the immutable 16-bit data contract: `types`, algorithm constants (`params`: `PENALTY_OBSTACLE`/`PENALTY_GOAL`/`STEP_COST`/`N_THETA`/…), the bit-exact `cost_of`, packed↔unpacked transition conversion (`transitions`), and `make_goal_mask` (`goal`). Mirrors the HLS/C/MATLAB contract.
+- `vi_reference` — a faithful u64 port of the ROS1 `value_iteration` node (`ValueIterator` / `State` / `Action`, PROB_BASE = 2^18 fixed point), reproducing its quirks (including the original's int-division and margin-penalty bugs). `solvers::solve(&mut ValueIterator, U64Solver, max_iter)` dispatches the 10 fast solvers — `Reference`, `Frontier2D/3D{,Tau,TopK,CoarseTheta}`, `FrontierStack`, `BlockRefine`, `PyramidSweep`, `StreamMimic` — each of which applies the original per-cell Bellman update over an active set, so the converged value of reachable cells is bit-exact with the ROS1 original (proven by the `solvers::test_support` parity tests). This is the active CPU model. Design: `docs/superpowers/specs/2026-06-08-vi-reference-faithful-port-design.md`, `2026-06-09-vi-u64-fast-solvers-design.md`.
+- `vi_algorithm` — now just the value-type-agnostic `bitboard` primitives (3-D θ-periodic dilation, 2-D AND/OR, enumerate, ndarray conv) that `vi_reference`'s frontier solvers reuse. The u16 `Solver`/`VIContext` family that used to live here was ported to `vi_reference` and removed.
+- `vi_fixtures` — `gen_test_map` / `gen_transitions` equivalents (u16). Orphaned after the u64 migration (its consumers were the removed u16 solvers); kept in the workspace but unused.
+- `vi_bench` — criterion benches + the `bench_summary` / `bench_map` CLIs, all over the u64 `vi_reference` solvers; the `bitboard` microbench still exercises `vi_algorithm`.
 
 ## Conventions
 
