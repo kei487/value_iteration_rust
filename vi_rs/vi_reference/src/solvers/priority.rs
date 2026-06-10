@@ -53,7 +53,7 @@ pub(crate) fn relax_cell(
 /// label-setting では常に 0、label-correcting で >0 なら Dial 化に注意）。
 #[derive(Clone, Copy, Debug)]
 pub struct PrioStats {
-    pub iters: u32,
+    pub iters: u64,
     pub updates: u64,
     pub converged: bool,
     pub repops: u64,
@@ -77,9 +77,9 @@ pub fn priority_solve(vi: &mut ValueIterator, max_iter: u32, label_setting: bool
         }
     }
 
-    let pop_cap = (n as u64).saturating_mul(max_iter.max(1) as u64); // 暴走ガード（実質無限）
+    let pop_cap = (n as u64).saturating_mul(max_iter.max(1) as u64); // 暴走ガード: LC は最大 n*max_iter pops で打ち切り（LS は 1 パス ≤ n pops）
     let mut pops = 0u64;
-    let mut iters = 0u32;
+    let mut iters = 0u64;
     let mut updates = 0u64;
     let mut repops = 0u64;
 
@@ -102,7 +102,7 @@ pub fn priority_solve(vi: &mut ValueIterator, max_iter: u32, label_setting: bool
         } else {
             popped[s_star] = true;
         }
-        iters += 1;
+        iters += 1; // LS: 各セル1回（≤ n）。LC: 再処理も計上（= 初回確定数 + repops）
 
         let (ix, iy, it) = (vi.states[s_star].ix, vi.states[s_star].iy, vi.states[s_star].it);
         for &(dix, diy, t) in &rev[it as usize] {
@@ -131,7 +131,7 @@ pub fn priority_solve(vi: &mut ValueIterator, max_iter: u32, label_setting: bool
 /// (A1) Priority Label-Setting（近似・最速）。`solve()` 用の軽量タプル。
 pub fn prio_ls_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
     let st = priority_solve(vi, max_iter, true);
-    (st.iters, st.updates, st.converged)
+    (st.iters.min(u32::MAX as u64) as u32, st.updates, st.converged)
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use crate::value_iterator::ValueIterator;
 
 pub fn prio_lc_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
     let st = priority_solve(vi, max_iter, false);
-    (st.iters, st.updates, st.converged)
+    (st.iters.min(u32::MAX as u64) as u32, st.updates, st.converged)
 }
 
 #[cfg(test)]
