@@ -25,6 +25,7 @@ pub mod stream;
 pub mod tau;
 pub mod topk;
 pub mod priority;
+pub mod prio_lc;
 
 /// dilation 変位 `(mx, my, mt)` を `actions` の全遷移から算出する。`dit` は絶対 θ なので、
 /// 各 (action, source theta `t`) について循環距離 `min(|dit-t|, nt-|dit-t|)` を取り `mt` とする。
