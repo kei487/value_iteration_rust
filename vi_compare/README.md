@@ -26,9 +26,13 @@ vi_compare/
 │       ├── vi_rs/           run_sweep_vi_rs.sh (bench_map の m 掃引; host 実行)
 │       ├── plot.py          図生成 (speed/house/lite/full/tsukuba モード)
 │       └── report_paper_style.md              論文対応レポート
+│   └── tsukuba/             tsukuba フル地図 (226M states) の動画素材生成
+│       └── ros1/            bench_tsukuba.launch + bench_client_tsukuba.py +
+│                            run_snap_tsukuba.sh (snapshot 付き TIMEOUT ラン)
 ├── video/                   スイープ可視化動画のレンダラ
 │   ├── render_frames.py         house 版 (×8 スローモーション)
 │   ├── render_frames_full.py    津田沼フル版 (real-time → ×40 timelapse)
+│   ├── render_frames_tsukuba.py tsukuba 版 (226M states; real-time → ×40 timelapse)
 │   └── value_iteration_snap/    本家のパッチ済コピー (snapshotWorker 追加)
 ├── results/                 生成物 (git 管理外; 下記)
 └── .cache/                  catkin_ws / cargo target の永続キャッシュ (git 管理外)
@@ -51,7 +55,12 @@ results/
 │   ├── frames_ros1/ frames_sparse/ snap_run/  動画素材 (計 ~5GB、消去可)
 │   ├── logs/                         生ログ
 │   └── video_ros1_vs_virs_tsudanuma_full.mp4
-└── tsukuba/        tsukuba マップ PoC (scale5, sparse 7.1s)
+└── tsukuba/        tsukuba マップ (2650×1420×60 = 226M states, scale5/0.25m)
+    ├── map_tsukuba_pooled.pgm/.yaml  pooled 地図 (origin -553.84/-60.609)
+    ├── value.bin path.bin fig_map_overlay_tsukuba.png  PoC (sparse 6.9s 収束)
+    ├── frames_sparse/ frames_ros1/ snap_run/  動画素材 (計 ~6GB、消去可)
+    └── video_ros1_vs_virs_tsukuba_full.mp4   ROS1 vs vi_rs 速度比較動画
+        (real-time → ×40 timelapse; vi_rs 6.9s 厳密収束 vs ROS1 575s 未収束)
 ```
 
 ディスクを空けたいとき: `frames_*/`, `video_frames/`, `snap_run/` は動画の
@@ -86,14 +95,46 @@ matplotlib は docker イメージ `raspicat-vla-sim:latest` で実行)。
 1. スナップショット付き計測: vi_rs 側は `VI_SNAP_DIR`/`VI_SNAP_EVERY` env
    (frontier2d_sparse の Snapshotter)、本家側は `video/value_iteration_snap/`
    を `/src_value_iteration` にマウントし `VI_SNAP_DIR`/`VI_SNAP_MS` env。
-2. レンダリング: `video/render_frames{,_full}.py` を raspicat-vla-sim で実行
+2. レンダリング: `video/render_frames{,_full,_tsukuba}.py` を raspicat-vla-sim で実行
    (リポジトリを `/work` にマウント) → `results/<map>/video_frames/` に PNG。
 3. エンコード: host ffmpeg は libx264 無し — `h264_nvenc -cq 21` か
    `libopenh264` を使う。
 
+tsukuba フル動画の再現 (0.15m/scale3 = 4417×2367×60 = 627M states; 津田沼と同設定
+goal world(20.5,-1.0,0°), margin_theta=15, radius=0.30。0.15m では goal mask=28
+セルで孤立しないので margin=15 のまま両側を揃えられる。0.25m 版が使った
+margin=180 回避策は不要)。**ピーク ~46GB 要 (states 35GB + Fused 11GB)** なので
+128GB 機推奨。RAM が足りない機では `VI_SNAP_DROP_STATES=1` で states を解放しつつ
+snapshot を出せる (write_back/policy は skip)。純 sweep ~17s で厳密収束:
+
+```sh
+# vi_rs sparse スナップショット (~17s 収束 + dump。pooled.yaml は 0.15m なので --scale 1)
+VI_THREADS=16 VI_SNAP_DIR=vi_compare/results/tsukuba/frames_sparse VI_SNAP_EVERY=5 \
+  vi_rs/target/release/bench_map \
+  --map vi_compare/results/tsukuba/map_tsukuba_pooled.yaml --scale 1 \
+  --solver frontier2d_sparse --goal-x=20.5 --goal-y=-1.0 --goal-theta-deg=0 \
+  --goal-radius-m 0.30 --goal-margin-theta-deg 15 \
+  --safety-radius-m 0.20 --safety-penalty 100000 --unknown obstacle
+
+# 本家 ROS1 スナップショット (docker, TIMEOUT まで未収束)
+docker run --rm \
+  -v "$PWD/vi_compare/video/value_iteration_snap:/src_value_iteration:ro" \
+  -v "$PWD:/workspace" -v "$PWD/vi_compare/.cache/catkin_ws:/catkin_ws" \
+  -e VI_SNAP_MS=2000 -e TIMEOUT=600 vi_compare_ros1:noetic \
+  bash /workspace/vi_compare/benches/tsukuba/ros1/run_snap_tsukuba.sh
+
+# レンダ + エンコード
+docker run --rm -v "$PWD:/work" raspicat-vla-sim:latest \
+  python3 /work/vi_compare/video/render_frames_tsukuba.py
+cd vi_compare/results/tsukuba && ffmpeg -y -framerate 30 \
+  -i video_frames/frame_%05d.png -c:v libx264 -crf 20 -preset medium -pix_fmt yuv420p \
+  video_ros1_vs_virs_tsukuba_015.mp4   # libx264 無い環境は -c:v h264_nvenc -cq 21
+```
+
 ## 整合性の注意
 
-- pooled 地図の origin は (0,0) 必須 (本家 `setStateValues` の goal 円盤計算が
-  origin に依存; `bench_map::build_occupancy` と bit 一致させる)。
+- goal 円盤計算は origin 依存 (本家 `setStateValues`)。両側で同一 origin なら可:
+  津田沼は origin (0,0) で揃える。tsukuba は実 origin (-553.84/-60.609) を両側で
+  共有 (vi_rs/ROS1 とも同一 yaml; goal cell が一致するので比較は等価)。
 - 本家 feedback の `_delta` は 18bit 固定小数の生値 (PROB_BASE=262144 = 1 s)。
 - `bench_map` の負座標は `--goal-y=-2.0` 形式 (clap)。

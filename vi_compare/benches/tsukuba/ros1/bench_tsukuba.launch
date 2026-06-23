@@ -1,0 +1,33 @@
+<launch>
+  <!-- 本家 value_iteration を tsukuba 0.15m プールマップ (4417x2367x60 = 627M states)
+       上で並列スイープ実行するベンチ用 launch。map_server(プールPGM) + vi_node。
+       planning params は vi_rs (bench_map) 側と一致させてある:
+         theta=60, safety_radius=0.2m, safety_radius_penalty=100000,
+         goal_margin_radius=0.5m, goal_margin_theta=180 (全θ受容)。
+       tsukuba の goal セル (2297,238) は θ窓が狭いと予測状態が無く孤立するため、
+       両側とも goal_margin_theta=180 (全周) で揃える。 -->
+  <arg name="map_yaml"   default="/workspace/vi_compare/results/tsukuba/map_tsukuba_pooled.yaml"/>
+  <arg name="thread_num" default="16"/>
+  <arg name="online"     default="false"/>
+  <rosparam>
+    vi_node:
+      action_list:
+        - {name: forward, onestep_forward_m: 0.3,  onestep_rotation_deg: 0.0}
+        - {name: back,    onestep_forward_m: -0.2, onestep_rotation_deg: 0.0}
+        - {name: right,   onestep_forward_m: 0.0,  onestep_rotation_deg: -20.0}
+        - {name: rightfw, onestep_forward_m: 0.2,  onestep_rotation_deg: -20.0}
+        - {name: left,    onestep_forward_m: 0.0,  onestep_rotation_deg: 20.0}
+        - {name: leftfw,  onestep_forward_m: 0.2,  onestep_rotation_deg: 20.0}
+  </rosparam>
+  <node pkg="map_server" name="map_server" type="map_server" args="$(arg map_yaml)"/>
+  <node pkg="value_iteration" name="vi_node" type="vi_node" output="screen" required="true">
+    <param name="online" value="$(arg online)"/>
+    <param name="theta_cell_num" value="60"/>
+    <param name="thread_num" value="$(arg thread_num)"/>
+    <param name="safety_radius" value="0.2"/>
+    <param name="safety_radius_penalty" value="100000.0"/>
+    <param name="goal_margin_radius" value="0.5"/>
+    <param name="goal_margin_theta" value="180"/>
+    <param name="map_type" value="occupancy"/>
+  </node>
+</launch>
