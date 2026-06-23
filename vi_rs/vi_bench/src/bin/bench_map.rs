@@ -375,10 +375,17 @@ fn main() -> ExitCode {
     };
 
     // Goal-mask sanity: count goal (cost-0) cells so an empty goal is visible.
-    let goal_cells = {
-        let vi = build();
-        vi.states.iter().filter(|s| s.total_cost < REACH).count()
-    };
+    // Build the ValueIterator once here and reuse it for the first solver's solve
+    // (subsequent solvers rebuild fresh in the loop). At 627M states a `set_map`
+    // build costs tens of seconds single-threaded, so this throwaway is worth avoiding.
+    let mut prebuilt: Option<ValueIterator> = Some(build());
+    let goal_cells = prebuilt
+        .as_ref()
+        .unwrap()
+        .states
+        .iter()
+        .filter(|s| s.total_cost < REACH)
+        .count();
 
     // --- Banner ---
     eprintln!(
@@ -470,7 +477,8 @@ fn main() -> ExitCode {
     let mut rows: Vec<Row> = Vec::new();
     for (sel, solver, budget) in schedule {
         eprintln!("running {sel} ...");
-        let mut vi = build();
+        // Reuse the prebuilt ValueIterator for the first solver; rebuild for the rest.
+        let mut vi = prebuilt.take().unwrap_or_else(|| build());
         let t0 = Instant::now();
         let stats = solve(&mut vi, solver, budget);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;

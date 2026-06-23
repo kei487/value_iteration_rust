@@ -145,23 +145,47 @@ impl ValueIterator {
 
     /// 本家 `setState`。
     fn set_state(&mut self, map: &OccupancyGrid, safety_radius: f64, safety_radius_penalty: f64) {
-        self.states.clear();
         let margin = (safety_radius / self.xy_resolution).ceil() as i32;
-        for y in 0..self.cell_num_y {
-            for x in 0..self.cell_num_x {
-                for t in 0..self.cell_num_t {
-                    self.states.push(State::from_occupancy(
-                        x,
-                        y,
-                        t,
-                        map,
-                        margin,
-                        safety_radius_penalty,
-                        self.cell_num_x,
-                    ));
-                }
-            }
+        let (nx, ny, nt) = (self.cell_num_x, self.cell_num_y, self.cell_num_t);
+        let n = nx as usize * ny as usize * nt as usize;
+        if n == 0 {
+            self.states = Vec::new();
+            return;
         }
+        // 行バンド並列で states を構築。本家の push 順 (y,x,t) を index=((y*nx+x)*nt+t) として
+        // そのまま再現するので本家と bit-exact (各 State は map+座標から独立決定。巨大マップでは
+        // この per-cell penalty 計算が単一スレッドだと数十秒かかるため並列化する)。
+        let per_row = nx as usize * nt as usize; // y 固定 1 行あたりの states 数
+        let mut states: Vec<State> = Vec::with_capacity(n);
+        let spare = states.spare_capacity_mut();
+        let nthr = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .clamp(1, ny as usize);
+        let rows_per = (ny as usize).div_ceil(nthr).max(1);
+        std::thread::scope(|s| {
+            for (band, chunk) in spare.chunks_mut(rows_per * per_row).enumerate() {
+                let y0 = (band * rows_per) as i32;
+                s.spawn(move || {
+                    let rows = (chunk.len() / per_row) as i32;
+                    let mut k = 0usize;
+                    for r in 0..rows {
+                        let y = y0 + r;
+                        for x in 0..nx {
+                            for t in 0..nt {
+                                chunk[k].write(State::from_occupancy(
+                                    x, y, t, map, margin, safety_radius_penalty, nx,
+                                ));
+                                k += 1;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // SAFETY: 各バンドが重複なく担当行を埋め、全 n 要素を一度ずつ初期化済み。
+        unsafe { states.set_len(n) };
+        self.states = states;
     }
 
     /// 本家 `setMapWithCostGrid`。`margin` は本家にあるが未使用。
