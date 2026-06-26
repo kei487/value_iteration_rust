@@ -30,9 +30,9 @@ vi_compare/
 │       └── ros1/            bench_tsukuba.launch + bench_client_tsukuba.py +
 │                            run_snap_tsukuba.sh (snapshot 付き TIMEOUT ラン)
 ├── video/                   スイープ可視化動画のレンダラ
-│   ├── render_frames.py         house 版 (×8 スローモーション)
-│   ├── render_frames_full.py    津田沼フル版 (real-time → ×40 timelapse)
-│   ├── render_frames_tsukuba.py tsukuba 版 (226M states; real-time → ×40 timelapse)
+│   ├── render_frames_house.py     house 版 (×8 スローモーション)
+│   ├── render_frames_tsudanuma.py 津田沼フル版 (real-time → ×40 timelapse)
+│   ├── render_frames_tsukuba.py   tsukuba 版 (226M states; real-time → ×40 timelapse)
 │   └── value_iteration_snap/    本家のパッチ済コピー (snapshotWorker 追加)
 ├── results/                 生成物 (git 管理外; 下記)
 └── .cache/                  catkin_ws / cargo target の永続キャッシュ (git 管理外)
@@ -95,7 +95,7 @@ matplotlib は docker イメージ `raspicat-vla-sim:latest` で実行)。
 1. スナップショット付き計測: vi_rs 側は `VI_SNAP_DIR`/`VI_SNAP_EVERY` env
    (frontier2d_sparse の Snapshotter)、本家側は `video/value_iteration_snap/`
    を `/src_value_iteration` にマウントし `VI_SNAP_DIR`/`VI_SNAP_MS` env。
-2. レンダリング: `video/render_frames{,_full,_tsukuba}.py` を raspicat-vla-sim で実行
+2. レンダリング: `video/render_frames_{house,tsudanuma,tsukuba}.py` を raspicat-vla-sim で実行
    (リポジトリを `/work` にマウント) → `results/<map>/video_frames/` に PNG。
 3. エンコード: host ffmpeg は libx264 無し — `h264_nvenc -cq 21` か
    `libopenh264` を使う。

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tsukuba フル (4417×2367×60 = 627M 状態) の ROS1 vs vi_rs sparse 並列スイープ動画。
 
-render_frames_full.py (津田沼) の tsukuba 版。違い:
+render_frames_tsudanuma.py (津田沼) の tsukuba 版。違い:
   - グリッド 4417×2367 (0.15 m/cell, x3 pool)、origin (-553.84, -60.609)。津田沼と同解像度。
   - goal world(20.5, -1.0, 0deg) → pooled cell (3828, iy=397)。goal_margin_theta=15・
     goal_radius=0.30 (津田沼と同設定)。0.15 m では goal mask=28 セルあり孤立しない

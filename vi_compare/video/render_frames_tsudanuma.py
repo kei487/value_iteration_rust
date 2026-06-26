@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """津田沼フル (1963×1334×60 = 157M 状態) の ROS1 vs vi_rs sparse 並列スイープ動画。
 
-house 版 (render_frames.py) との違い:
+house 版 (render_frames_house.py) との違い:
   - 両側 16 スレッド同士の比較。
   - ROS1 はこの規模では収束しない → フェーズ構成:
       intro → real-time ×1 (sparse が 11.9 s で厳密収束するまで) →
