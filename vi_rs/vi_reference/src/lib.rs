@@ -25,3 +25,7 @@ pub mod local;
 
 pub use local::ValueIteratorLocal;
 pub mod solvers;
+
+// 旧 vi_algorithm から取り込んだ word 並列 bitboard プリミティブ。solvers のフロンティアが
+// 使い、vi_bench の bitboard マイクロベンチが `vi_reference::bitboard` として参照する。
+pub mod bitboard;

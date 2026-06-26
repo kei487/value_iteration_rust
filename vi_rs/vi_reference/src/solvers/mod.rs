@@ -8,7 +8,7 @@ use crate::value_iterator::ValueIterator;
 
 // フロンティアには実績ある word 並列 Bitboard を再利用する（u16 frontier の高速化の源）。
 // Bitboard は値の型に非依存なので u64 モデルでもそのまま使える。dilate は theta periodic。
-pub(crate) use vi_algorithm::bitboard::{Bitboard2D, Bitboard3D};
+pub(crate) use crate::bitboard::{Bitboard2D, Bitboard3D};
 
 pub mod block;
 pub mod coarse_theta;

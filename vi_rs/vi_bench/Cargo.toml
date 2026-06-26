@@ -6,9 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 vi_core      = { path = "../vi_core" }
-# bitboard ベンチ (benches/bitboard.rs) のみが参照。ソルバは vi_reference に移行済み。
-vi_algorithm = { path = "../vi_algorithm" }
 # u64 (本家忠実) ソルバ群。bench_summary / bench_map / criterion ベンチの本体。
+# bitboard ベンチ (benches/bitboard.rs) は vi_reference::bitboard を参照する。
 vi_reference = { path = "../vi_reference" }
 criterion    = { workspace = true }
 clap         = { workspace = true }

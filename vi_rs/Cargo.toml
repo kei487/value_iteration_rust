@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vi_core", "vi_algorithm", "vi_fixtures", "vi_bench", "vi_reference"]
+members = ["vi_core", "vi_bench", "vi_reference"]
 
 [workspace.package]
 edition = "2021"
@@ -11,7 +11,5 @@ ndarray   = "0.16"
 rayon     = "1.10"
 thiserror = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
-once_cell = "1"
-rand      = "0.8"
 proptest  = "1"
 clap      = { version = "4", features = ["derive"] }
