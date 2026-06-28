@@ -338,8 +338,8 @@ fn finalize_column(
     cnt
 }
 
-/// 詳細統計（テスト/退避判定で使う）。
-pub(crate) struct CompactStats {
+/// 詳細統計（テスト/退避判定/ベンチで使う）。
+pub struct CompactStats {
     pub iters: u32,
     pub updates: u64,
     pub converged: bool,
@@ -368,7 +368,7 @@ pub fn frontier2d_sparse_compact_solve(vi: &mut ValueIterator, max_iter: u32) ->
 
 /// 本体（値バンド閾値スキャン + during-solve ウォーターマーク finalization + 遅延確保 + 退避、
 /// 単一スレッド）。`band` 可変（`--mem-budget` の土台）。`band ≥ 結合深さ` なら本家と bit-exact。
-pub(crate) fn solve_compact(
+pub fn solve_compact(
     vi: &mut ValueIterator,
     max_iter: u32,
     band_override: Option<u64>,

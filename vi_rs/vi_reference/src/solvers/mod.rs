@@ -392,6 +392,8 @@ pub enum U64Solver {
     Frontier2DParUnsafe,
     Frontier2DFused,
     Frontier2DSparse,
+    /// アウトオブコア版。`band`=0 で auto（結合深さ安全側）、>0 で値バンド幅を明示（メモリ予算つまみ）。
+    Frontier2DSparseCompact { band: u64 },
     FrontierStack,
     BlockRefine,
     PyramidSweep,
@@ -415,6 +417,7 @@ impl U64Solver {
             "frontier2d_par_unsafe" => U64Solver::Frontier2DParUnsafe,
             "frontier2d_fused" => U64Solver::Frontier2DFused,
             "frontier2d_sparse" => U64Solver::Frontier2DSparse,
+            "frontier2d_sparse_compact" => U64Solver::Frontier2DSparseCompact { band: 0 },
             "frontier_stack" => U64Solver::FrontierStack,
             "block_refine" => U64Solver::BlockRefine,
             "pyramid_sweep" => U64Solver::PyramidSweep,
@@ -472,6 +475,14 @@ pub fn solve(vi: &mut ValueIterator, solver: U64Solver, max_iter: u32) -> U64Sol
         U64Solver::Frontier2DPar => frontier2d_par::frontier2d_par_solve(vi, max_iter),
         U64Solver::Frontier2DFused => frontier2d_fused::frontier2d_fused_solve(vi, max_iter),
         U64Solver::Frontier2DSparse => frontier2d_sparse::frontier2d_sparse_solve(vi, max_iter),
+        U64Solver::Frontier2DSparseCompact { band } => {
+            let s = frontier2d_sparse_compact::solve_compact(
+                vi,
+                max_iter,
+                if band == 0 { None } else { Some(band) },
+            );
+            (s.iters, s.updates, s.converged)
+        }
         U64Solver::Frontier2DParUnsafe => {
             frontier2d_par_unsafe::frontier2d_par_unsafe_solve(vi, max_iter)
         }

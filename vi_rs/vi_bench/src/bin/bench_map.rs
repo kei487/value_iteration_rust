@@ -58,7 +58,8 @@ use clap::Parser;
 use vi_bench::fixtures::canonical_actions;
 use vi_bench::pgm::{self, Occupancy, PgmMap};
 use vi_reference::params::{MAX_COST, PROB_BASE};
-use vi_reference::solvers::{solve, U64Solver};
+use vi_reference::solvers::frontier2d_sparse_compact::solve_compact;
+use vi_reference::solvers::{solve, U64SolveStats, U64Solver};
 use vi_reference::{OccupancyGrid, Quaternion, State, ValueIterator};
 
 /// Canonical theta cell count (本家 launch / data contract).
@@ -127,6 +128,11 @@ struct Args {
     #[arg(long, default_value_t = 2_000_000)]
     max_iters: u32,
 
+    /// 値バンド幅（`frontier2d_sparse_compact` 専用、18bit 固定小数点単位）。0=auto（結合深さの
+    /// 安全側）。小さいほど常駐メモリは減るが、結合深さ未満だと bit-exact が壊れる。
+    #[arg(long, default_value_t = 0)]
+    compact_band: u64,
+
     /// Optional CSV output path (parent dirs created).
     #[arg(long)]
     out: Option<PathBuf>,
@@ -172,6 +178,10 @@ enum SolverSel {
     /// fused + θマスク疎評価 (依存 θ のみ再評価)。収束値は bit-exact のまま。
     #[value(name = "frontier2d_sparse")]
     Frontier2dSparse,
+    /// アウトオブコア版（値バンド+遅延確保+退避）。メモリ制約下で巨大マップを bit-exact に解く。
+    /// `--compact-band` で値バンド幅（0=auto）。
+    #[value(name = "frontier2d_sparse_compact")]
+    Frontier2dSparseCompact,
     Both,
 }
 
@@ -465,6 +475,13 @@ fn main() -> ExitCode {
     if matches!(args.solver, SolverSel::Frontier2dSparse) {
         schedule.push(("frontier2d_sparse", U64Solver::Frontier2DSparse, args.max_iters));
     }
+    if matches!(args.solver, SolverSel::Frontier2dSparseCompact) {
+        schedule.push((
+            "frontier2d_sparse_compact",
+            U64Solver::Frontier2DSparseCompact { band: args.compact_band },
+            args.max_iters,
+        ));
+    }
 
     if want_ref && states > 100_000_000 {
         eprintln!(
@@ -481,7 +498,22 @@ fn main() -> ExitCode {
         // Reuse the prebuilt ValueIterator for the first solver; rebuild for the rest.
         let mut vi = prebuilt.take().unwrap_or_else(|| build());
         let t0 = Instant::now();
-        let stats = solve(&mut vi, solver, budget);
+        // compact は CompactStats を直接取ってメモリ指標も出す（汎用 solve は値を捨てるため）。
+        let stats = match solver {
+            U64Solver::Frontier2DSparseCompact { band } => {
+                let s = solve_compact(&mut vi, budget, if band == 0 { None } else { Some(band) });
+                eprintln!(
+                    "  memory: resident_blocks_peak={}/{}  freed_blocks={}  resident_cols_peak={}/{}",
+                    s.peak_resident_blocks,
+                    s.total_blocks,
+                    s.freed_blocks,
+                    s.peak_resident_cols,
+                    s.reachable_cols,
+                );
+                U64SolveStats { iters: s.iters, updates: s.updates, converged: s.converged }
+            }
+            _ => solve(&mut vi, solver, budget),
+        };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let row = Row {
             solver: sel,
