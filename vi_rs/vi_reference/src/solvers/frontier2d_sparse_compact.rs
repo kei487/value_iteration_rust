@@ -303,22 +303,24 @@ fn finalize_column(
     ix: i32,
     iy: i32,
     states: &[State],
-    out_total: &mut [u64],
-    out_action: &mut [i32],
+    sink: &mut dyn CompactSink,
 ) -> u64 {
     ensure_window(store, ix, iy, states);
     let pad_col = g.pad_col(ix, iy);
     let (nt, nx) = (g.nt, g.nx);
+    let ntu = nt as usize;
+    // 列の全 θ を一旦バッファに作り、sink へ 1 回で書く（ディスク sink でも列連続 write になる）。
+    let mut buf_v = vec![MAX_COST; ntu];
+    let mut buf_a = vec![-1i32; ntu];
     let mut cnt = 0u64;
     for it in 0..nt {
         let pad_idx = (pad_col + it as i64) as usize;
         let cp = store.get(pad_idx);
         if cp == UNREACHED {
-            continue; // 未到達: 出力は初期 (MAX_COST, -1) のまま。
+            continue; // 未到達: バッファは初期 (MAX_COST, -1) のまま。
         }
         let pen = store.pen(pad_idx);
-        let orig = (it + ix * nt + iy * nt * nx) as usize;
-        out_total[orig] = cp.wrapping_sub(pen);
+        buf_v[it as usize] = cp.wrapping_sub(pen);
         if store.eval_ok(pad_idx) {
             let mut min_cost = MAX_COST;
             let mut min_action = -1i32;
@@ -329,13 +331,50 @@ fn finalize_column(
                     min_action = ai as i32;
                 }
             }
-            out_action[orig] = min_action;
+            buf_a[it as usize] = min_action;
             store.set_final(pad_idx);
             cnt += 1;
         }
-        // 非 eval（ゴール）: out_action は初期 -1（None）のまま、out_total はピン留め値。
+        // 非 eval（ゴール）: action は -1（None）、value はピン留め値。
     }
+    let base = (ix * nt + iy * nt * nx) as usize; // orig(it=0)
+    sink.write_column(base, &buf_v, &buf_a);
     cnt
+}
+
+/// 確定出力（value, policy）の格納先を抽象化する sink。finalize 時に列単位で書き込み、
+/// write_back 時に orig 単位で読む。RAM 実装（`RamSink`）と、呼び出し側のディスク mmap 実装
+/// （`vi_bench::MmapSink`）を差し替えられる。これで出力の O(total) RAM をディスクへ外せる
+/// （巨大マップ対応）。vi_reference は依存軽量なので mmap 実装はここには置かない。
+pub trait CompactSink {
+    /// 連続 orig 範囲 `[base, base+values.len())` へ value/action を書く（列の全 θ を 1 回で）。
+    fn write_column(&mut self, base: usize, values: &[u64], actions: &[i32]);
+    /// orig セルの (value, action) を読む。action<0 は None。
+    fn read(&self, orig: usize) -> (u64, i32);
+}
+
+/// 既定の RAM 実装（2 本の `Vec`）。未書き込みセル（到達不能/パディング）は `(MAX_COST, -1)`。
+pub struct RamSink {
+    total: Vec<u64>,
+    action: Vec<i32>,
+}
+
+impl RamSink {
+    pub fn new(nstates: usize) -> Self {
+        Self { total: vec![MAX_COST; nstates], action: vec![-1; nstates] }
+    }
+}
+
+impl CompactSink for RamSink {
+    #[inline]
+    fn write_column(&mut self, base: usize, values: &[u64], actions: &[i32]) {
+        self.total[base..base + values.len()].copy_from_slice(values);
+        self.action[base..base + actions.len()].copy_from_slice(actions);
+    }
+    #[inline]
+    fn read(&self, orig: usize) -> (u64, i32) {
+        (self.total[orig], self.action[orig])
+    }
 }
 
 /// 詳細統計（テスト/退避判定/ベンチで使う）。
@@ -373,17 +412,24 @@ pub fn solve_compact(
     max_iter: u32,
     band_override: Option<u64>,
 ) -> CompactStats {
+    // 既定は RAM 出力（states 数 = nx·ny·nt）。
+    let mut sink = RamSink::new(vi.states.len());
+    solve_compact_into(vi, max_iter, band_override, &mut sink)
+}
+
+/// `solve_compact` の出力 sink 差し替え版。確定出力（value/policy）を `sink`（RAM or ディスク
+/// mmap）へ書き、write_back も sink から読む。これで出力の O(total) RAM をディスクへ外せる。
+pub fn solve_compact_into(
+    vi: &mut ValueIterator,
+    max_iter: u32,
+    band_override: Option<u64>,
+    sink: &mut dyn CompactSink,
+) -> CompactStats {
     let g = Geom::build(vi);
     let (nx, ny) = (g.nx, g.ny);
     let (dx, dy) = (g.mx as u32, g.my as u32);
     let ncol = (nx * ny) as usize;
     let cidx = |ix: i32, iy: i32| (iy * nx + ix) as usize;
-
-    // 確定出力（store から切り離す。退避後もここに残るので write_back はこちらから読む）。
-    // orig 索引 `it + ix·nt + iy·nt·nx`。S4 でこれを mmap 化してディスクへ。
-    let nstates = (nx * ny * g.nt) as usize;
-    let mut out_total = vec![MAX_COST; nstates];
-    let mut out_action = vec![-1i32; nstates];
 
     let halo_blocks = (g.my as usize).div_ceil(BLOCK_ROWS);
 
@@ -463,15 +509,7 @@ pub fn solve_compact(
             for ix in 0..nx {
                 let i = cidx(ix, iy);
                 if !col_final[i] && col_max[i] != MAX_COST && col_max[i] <= wm {
-                    finalized += finalize_column(
-                        &mut store,
-                        &g,
-                        ix,
-                        iy,
-                        states,
-                        &mut out_total,
-                        &mut out_action,
-                    );
+                    finalized += finalize_column(&mut store, &g, ix, iy, states, sink);
                     col_final[i] = true;
                 }
             }
@@ -533,9 +571,9 @@ pub fn solve_compact(
     };
 
     let total_blocks = store.nblocks() as u64;
-    drop(store); // 残常駐ブロックも解放（出力は out_* に確定済み）。states 借用もここで終わる。
+    drop(store); // 残常駐ブロックも解放（出力は sink に確定済み）。states 借用もここで終わる。
 
-    write_back_output(vi, &g, &out_total, &out_action);
+    write_back_sink(vi, &g, sink);
 
     let reachable = vi
         .states
@@ -558,18 +596,15 @@ pub fn solve_compact(
     }
 }
 
-/// 確定出力配列（finalize 時に保存済み）から states へ値・方策を書き戻す。退避でブロックが解放
-/// されていても出力は残るので store には触れない。orig 索引 `it + ix·nt + iy·nt·nx`。
-fn write_back_output(vi: &mut ValueIterator, g: &Geom, out_total: &[u64], out_action: &[i32]) {
+/// 確定出力 sink（finalize 時に保存済み）から states へ値・方策を書き戻す。退避でブロックが解放
+/// されていても sink に残るので store には触れない。orig 索引 `it + ix·nt + iy·nt·nx`。
+fn write_back_sink(vi: &mut ValueIterator, g: &Geom, sink: &dyn CompactSink) {
     let (nt, nx) = (g.nt, g.nx);
     for s in vi.states.iter_mut() {
         let orig = (s.it + s.ix * nt + s.iy * nt * nx) as usize;
-        s.total_cost = out_total[orig];
-        s.optimal_action = if out_action[orig] < 0 {
-            None
-        } else {
-            Some(out_action[orig] as usize)
-        };
+        let (v, a) = sink.read(orig);
+        s.total_cost = v;
+        s.optimal_action = if a < 0 { None } else { Some(a as usize) };
     }
 }
 

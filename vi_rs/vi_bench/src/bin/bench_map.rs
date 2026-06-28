@@ -58,7 +58,10 @@ use clap::Parser;
 use vi_bench::fixtures::canonical_actions;
 use vi_bench::pgm::{self, Occupancy, PgmMap};
 use vi_reference::params::{MAX_COST, PROB_BASE};
-use vi_reference::solvers::frontier2d_sparse_compact::solve_compact;
+use memmap2::MmapMut;
+use vi_reference::solvers::frontier2d_sparse_compact::{
+    solve_compact, solve_compact_into, CompactSink,
+};
 use vi_reference::solvers::{solve, U64SolveStats, U64Solver};
 use vi_reference::{OccupancyGrid, Quaternion, State, ValueIterator};
 
@@ -133,6 +136,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     compact_band: u64,
 
+    /// compact の確定出力をディスク mmap に置くディレクトリ（value/policy を RAM から外す）。
+    /// 未指定なら RAM 出力。巨大マップで出力の O(total) RAM を避けたいとき指定する。
+    #[arg(long)]
+    compact_out_dir: Option<PathBuf>,
+
     /// Optional CSV output path (parent dirs created).
     #[arg(long)]
     out: Option<PathBuf>,
@@ -192,6 +200,58 @@ struct Row {
     updates: u64,
     total_ms: f64,
     converged: bool,
+}
+
+/// `frontier2d_sparse_compact` の確定出力をディスク mmap に置く `CompactSink` 実装。value (u64 LE)
+/// と policy (i32 LE) を 2 ファイルに分け、列連続で write、orig 単位で read する。これで出力の
+/// O(total) RAM をディスクへ外せる（巨大マップ対応）。未書き込み = 到達不能 → (MAX_COST, -1)。
+struct MmapSink {
+    value: MmapMut,  // nstates * 8 bytes
+    action: MmapMut, // nstates * 4 bytes
+}
+
+impl MmapSink {
+    fn new(dir: &std::path::Path, nstates: usize) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let map = |name: &str, bytes: usize| -> std::io::Result<MmapMut> {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dir.join(name))?;
+            f.set_len(bytes as u64)?;
+            unsafe { MmapMut::map_mut(&f) }
+        };
+        let mut value = map("compact_value.bin", nstates * 8)?;
+        let mut action = map("compact_action.bin", nstates * 4)?;
+        // 初期化: 未書き込み（到達不能）セルが (MAX_COST, None) と読めるように。
+        let le = MAX_COST.to_le_bytes();
+        for rec in value.chunks_exact_mut(8) {
+            rec.copy_from_slice(&le);
+        }
+        action.fill(0xFF); // i32 -1 = 全バイト 0xFF。
+        Ok(Self { value, action })
+    }
+}
+
+impl CompactSink for MmapSink {
+    fn write_column(&mut self, base: usize, values: &[u64], actions: &[i32]) {
+        let vb = &mut self.value[base * 8..(base + values.len()) * 8];
+        for (i, &v) in values.iter().enumerate() {
+            vb[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        let ab = &mut self.action[base * 4..(base + actions.len()) * 4];
+        for (i, &a) in actions.iter().enumerate() {
+            ab[i * 4..i * 4 + 4].copy_from_slice(&a.to_le_bytes());
+        }
+    }
+
+    fn read(&self, orig: usize) -> (u64, i32) {
+        let v = u64::from_le_bytes(self.value[orig * 8..orig * 8 + 8].try_into().unwrap());
+        let a = i32::from_le_bytes(self.action[orig * 4..orig * 4 + 4].try_into().unwrap());
+        (v, a)
+    }
 }
 
 fn default_map_path() -> PathBuf {
@@ -501,7 +561,21 @@ fn main() -> ExitCode {
         // compact は CompactStats を直接取ってメモリ指標も出す（汎用 solve は値を捨てるため）。
         let stats = match solver {
             U64Solver::Frontier2DSparseCompact { band } => {
-                let s = solve_compact(&mut vi, budget, if band == 0 { None } else { Some(band) });
+                let bo = if band == 0 { None } else { Some(band) };
+                // --compact-out-dir 指定時は出力をディスク mmap へ（O(total) RAM を外す）。
+                let s = if let Some(dir) = &args.compact_out_dir {
+                    let nstates = vi.states.len();
+                    eprintln!(
+                        "  output: disk mmap at {} ({} states, ~{:.2} GB on disk)",
+                        dir.display(),
+                        nstates,
+                        nstates as f64 * 12.0 / 1e9,
+                    );
+                    let mut sink = MmapSink::new(dir, nstates).expect("create mmap output sink");
+                    solve_compact_into(&mut vi, budget, bo, &mut sink)
+                } else {
+                    solve_compact(&mut vi, budget, bo)
+                };
                 eprintln!(
                     "  memory: resident_blocks_peak={}/{}  freed_blocks={}  resident_cols_peak={}/{}",
                     s.peak_resident_blocks,

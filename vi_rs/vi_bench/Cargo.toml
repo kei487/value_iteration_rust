@@ -10,6 +10,8 @@ rust-version.workspace = true
 vi_reference = { path = "../vi_reference" }
 criterion    = { workspace = true }
 clap         = { workspace = true }
+# bench_map の compact ソルバ用ディスク mmap 出力（CompactSink 実装 MmapSink）。
+memmap2      = { workspace = true }
 
 [features]
 default = []
