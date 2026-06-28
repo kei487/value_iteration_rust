@@ -3,6 +3,9 @@
 //! セルの収束値は Reference (全走査) = 本家と bit-exact。
 //! 設計: `docs/superpowers/specs/2026-06-09-vi-u64-fast-solvers-design.md`
 
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Barrier;
+
 use crate::params::MAX_COST;
 use crate::value_iterator::ValueIterator;
 
@@ -17,6 +20,7 @@ pub mod frontier2d_pad;
 pub mod frontier2d_par;
 pub mod frontier2d_fused;
 pub mod frontier2d_sparse;
+pub mod frontier2d_sparse_compact;
 pub mod frontier2d_par_unsafe;
 pub mod frontier2d_soa;
 #[cfg(test)]
@@ -219,6 +223,157 @@ where
         }
     }
     opt
+}
+
+/// 非同期 (Gauss-Seidel) 並列フロンティアエンジンがスレッド間で共有する生ポインタ束。
+/// 永続ワーカーが Copy で持つ。全アクセスはバリアで相分離し「単一書き手 + バリア後読み」を守る。
+/// - `cand`: 今ラウンドの候補セル。リーダーが B1〜B2 間で差し替え、ワーカーは compute 相でのみ読む。
+/// - `changed`: 長さ `nthreads` の配列の先頭。compute 相でワーカー `w` が `changed[w]` のみ書く。
+#[derive(Clone, Copy)]
+struct GsShared {
+    cand: *mut Vec<(u32, u32)>,
+    changed: *mut Vec<(u32, u32)>,
+}
+// SAFETY: 上記のとおり全アクセスはバリアで相分離され、単一書き手 + バリア後読みの規律を守る。
+unsafe impl Send for GsShared {}
+unsafe impl Sync for GsShared {}
+
+/// 非同期 (Gauss-Seidel) unsafe 並列フロンティアの共通エンジン。`frontier2d_par_unsafe`
+/// (pad モデル) と `frontier2d_fused` (cp 融合モデル) が共有する並列骨格 ——
+/// 永続スレッド + 再利用バリア×2/ラウンド、work-stealing (BLOCK 件の `fetch_add` claim)、
+/// in-place 非同期書き込み (各セルの書き手は claim により常に 1 スレッド)、リーダー (w==0) による
+/// changed→次フロンティア再構築・走査方向のラウンド毎反転・終了判定 —— を 1 箇所にまとめる。
+/// 2 モデルの差は per-cell 評価 `eval(ix, iy) -> (changed, updates)` だけで、データビュー
+/// (`[[AtomicU64; 2]]` / `[AtomicU64]`) と数式は `eval` クロージャに閉じ込める。
+///
+/// `eval` は候補セル `(ix,iy)` の全 θ 層を Bellman 更新し、`(値を下げた θ があるか, 減少 θ 層数)`
+/// を返す（共有 atomic ビューへの書き込みは `eval` 内で行う）。`Fn + Sync` なので全ワーカーで共有
+/// できる。`(iters, updates, converged)` を返す。
+///
+/// θ マスク疎評価版 (`frontier2d_sparse`) は changed が θマスクを運び、リーダーがマスク配列を
+/// 管理するため、このエンジンは共有せず独自実装を持つ。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn async_gs_engine<F>(
+    nx: i32,
+    ny: i32,
+    dx: u32,
+    dy: u32,
+    nthreads: usize,
+    max_iter: u32,
+    mut cand_list: Vec<(u32, u32)>,
+    eval: F,
+) -> (u32, u64, bool)
+where
+    F: Fn(i32, i32) -> (bool, u64) + Sync,
+{
+    let mut changed_lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nthreads];
+    let shared = GsShared {
+        cand: &mut cand_list as *mut Vec<(u32, u32)>,
+        changed: changed_lists.as_mut_ptr(),
+    };
+
+    let barrier = Barrier::new(nthreads);
+    let done = AtomicBool::new(false);
+    let iters_out = AtomicU32::new(0);
+    let converged_out = AtomicBool::new(false);
+    // work-stealing カーソル: 候補リストを BLOCK 件単位で fetch_add により動的分配する。
+    let cursor = AtomicUsize::new(0);
+    let eval = &eval;
+
+    let total_updates: u64 = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|w| {
+                let barrier = &barrier;
+                let done = &done;
+                let iters_out = &iters_out;
+                let converged_out = &converged_out;
+                let cursor = &cursor;
+                scope.spawn(move || -> u64 {
+                    // `GsShared` 全体を再束縛してクロージャに「構造体まるごと」をキャプチャさせる
+                    // (Rust 2021 のフィールド分割キャプチャだと生ポインタ単体が捕まり Send にならない)。
+                    #[allow(clippy::redundant_locals)]
+                    let shared = shared;
+                    let mut my_updates: u64 = 0;
+                    let mut iter_count: u32 = 0;
+                    loop {
+                        // ── compute (並列・in-place 非同期書き込み) ──
+                        // SAFETY (cand): リーダーの差し替えは B1〜B2 間のみ、ここは B2 後の compute 相
+                        // — バリアの happens-before で可視・無競合。
+                        let cand = unsafe { &*shared.cand };
+                        let n = cand.len();
+                        // SAFETY: ワーカー w は changed[w] だけを触る（他スレッドと排他）。
+                        let my_changed = unsafe { &mut *shared.changed.add(w) };
+                        my_changed.clear();
+
+                        // work stealing: BLOCK 件の連続ブロックを fetch_add で claim する。
+                        // 各ブロックの claim は一意なので「セルの書き手は 1 スレッド」が保たれる。
+                        const BLOCK: usize = 16;
+                        loop {
+                            let s = cursor.fetch_add(BLOCK, Ordering::Relaxed);
+                            if s >= n {
+                                break;
+                            }
+                            let e = (s + BLOCK).min(n);
+                            for &(ixu, iyu) in &cand[s..e] {
+                                let (cell_changed, ups) = eval(ixu as i32, iyu as i32);
+                                my_updates += ups;
+                                if cell_changed {
+                                    my_changed.push((ixu, iyu));
+                                }
+                            }
+                        }
+
+                        barrier.wait(); // B1: 全 hot/changed 書き込みが可視。
+
+                        // ── リーダー直列: changed → 次フロンティア再構築 / 終了判定 ──
+                        if w == 0 {
+                            iter_count += 1;
+                            let mut any = false;
+                            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
+                            for i in 0..nthreads {
+                                // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
+                                let cl = unsafe { &*shared.changed.add(i) };
+                                if !cl.is_empty() {
+                                    any = true;
+                                }
+                                for &(ixu, iyu) in cl {
+                                    nf.set(ixu, iyu);
+                                }
+                            }
+                            if any && iter_count < max_iter {
+                                let mut next: Vec<(u32, u32)> =
+                                    nf.dilate(dx, dy).enumerate().collect();
+                                // 対称 Gauss-Seidel 風: 走査方向をラウンドごとに反転。
+                                if iter_count % 2 == 1 {
+                                    next.reverse();
+                                }
+                                // SAFETY: 他ワーカーは B1〜B2 間 cand を読まない。
+                                unsafe {
+                                    *shared.cand = next;
+                                }
+                                cursor.store(0, Ordering::Relaxed);
+                            } else {
+                                iters_out.store(iter_count, Ordering::Relaxed);
+                                converged_out.store(!any, Ordering::Relaxed);
+                                done.store(true, Ordering::Relaxed);
+                            }
+                        }
+
+                        barrier.wait(); // B2: リーダーの cand 差し替え / done が可視。
+                        if done.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    my_updates
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    let iters = iters_out.load(Ordering::Relaxed);
+    let converged = converged_out.load(Ordering::Relaxed);
+    (iters, total_updates, converged)
 }
 
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
