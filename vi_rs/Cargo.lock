@@ -928,8 +928,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "criterion",
- "ndarray",
- "vi_core",
  "vi_reference",
 ]
 

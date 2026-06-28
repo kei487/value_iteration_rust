@@ -28,6 +28,23 @@ pub(crate) fn or_slice(a: &mut [u64], b: &[u64]) {
     }
 }
 
+/// Row layout for [`dilate2d_into`] (constant across all rows of a map):
+/// rows per map, words per row, and the trailing-bit row mask.
+#[derive(Clone, Copy)]
+pub(crate) struct RowLayout<'a> {
+    pub map_y: usize,
+    pub wpr: usize,
+    pub rmask: &'a [u64],
+}
+
+/// Row-sized scratch buffers reused across [`dilate2d_into`] calls to avoid
+/// per-call allocation (one `dilate3d` shares a single `Scratch` over all layers).
+#[derive(Default)]
+pub(crate) struct Scratch {
+    pub pos: Vec<u64>,
+    pub neg: Vec<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // shift_row
 // ---------------------------------------------------------------------------
@@ -91,29 +108,26 @@ pub(crate) fn shift_row(out: &mut [u64], row: &[u64], sx: i32, rmask: &[u64]) {
 
 /// L-infinity box dilation written into an existing slice `dst`.
 ///
-/// `dst`, `src`, and `row_mask` all have length `map_y * wpr`.
-/// `scratch_pos` and `scratch_neg` are caller-provided row-sized scratch
-/// buffers (length `wpr`) reused across calls to avoid per-call allocation.
+/// `dst`, `src`, and `layout.rmask` all have length `layout.map_y * layout.wpr`.
+/// `scratch` holds caller-provided row-sized buffers (length `wpr`) reused
+/// across calls to avoid per-call allocation.
 ///
 /// Algorithm (mirrors `bb_dilate2d.m`):
 /// 1. Y-pass: copy `src` into `dst`, then OR shifted rows from `src`.
 /// 2. X-pass (if `dx > 0`): for each row, save the Y-dilated row into
-///    `scratch_pos`, then for each `sx_abs` OR ±shifted versions into `dst`.
+///    `scratch.pos`, then for each `sx_abs` OR ±shifted versions into `dst`.
 /// 3. Final mask applied inside the X-pass (and in the dx==0 fast-path).
 ///
 /// Panics if `dx >= 64`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn dilate2d_into(
     dst: &mut [u64],
     src: &[u64],
-    map_y: usize,
-    wpr: usize,
+    layout: &RowLayout,
     dx: u32,
     dy: u32,
-    scratch_pos: &mut Vec<u64>,
-    scratch_neg: &mut Vec<u64>,
-    rmask: &[u64],
+    scratch: &mut Scratch,
 ) {
+    let RowLayout { map_y, wpr, rmask } = *layout;
     assert!(dx < 64, "bb_dilate2d: dx >= 64 ({dx}) not supported");
 
     // --- Y-pass: dst ← y_dilated ---
@@ -150,26 +164,26 @@ pub(crate) fn dilate2d_into(
     }
 
     // --- X-pass ---
-    // For each row: save its Y-dilated value into scratch_pos, then for each
+    // For each row: save its Y-dilated value into scratch.pos, then for each
     // sx_abs OR ±shifted versions into dst.
-    // scratch_neg is reused for each individual shifted row.
-    scratch_pos.resize(wpr, 0u64);
-    scratch_neg.resize(wpr, 0u64);
+    // scratch.neg is reused for each individual shifted row.
+    scratch.pos.resize(wpr, 0u64);
+    scratch.neg.resize(wpr, 0u64);
 
     for iy in 0..map_y {
         let row_start = iy * wpr;
-        // Copy the Y-dilated row into scratch_pos (so reads are stable while
+        // Copy the Y-dilated row into scratch.pos (so reads are stable while
         // we accumulate the OR into dst[row_start..]).
-        scratch_pos.copy_from_slice(&dst[row_start..row_start + wpr]);
+        scratch.pos.copy_from_slice(&dst[row_start..row_start + wpr]);
 
         for sx_abs in 1..=(dx as i32) {
-            shift_row(scratch_neg, scratch_pos, sx_abs, rmask);
+            shift_row(&mut scratch.neg, &scratch.pos, sx_abs, rmask);
             for w in 0..wpr {
-                dst[row_start + w] |= scratch_neg[w];
+                dst[row_start + w] |= scratch.neg[w];
             }
-            shift_row(scratch_neg, scratch_pos, -sx_abs, rmask);
+            shift_row(&mut scratch.neg, &scratch.pos, -sx_abs, rmask);
             for w in 0..wpr {
-                dst[row_start + w] |= scratch_neg[w];
+                dst[row_start + w] |= scratch.neg[w];
             }
         }
 
@@ -197,20 +211,10 @@ pub(crate) fn dilate2d(bb: &Bitboard2D, dx: u32, dy: u32) -> Bitboard2D {
 
     // Allocate output + two scratch row-buffers (the only heap allocs here).
     let mut out_data = vec![0u64; map_y * wpr];
-    let mut scratch_pos = Vec::with_capacity(wpr);
-    let mut scratch_neg = Vec::with_capacity(wpr);
+    let mut scratch = Scratch::default();
 
-    dilate2d_into(
-        &mut out_data,
-        src,
-        map_y,
-        wpr,
-        dx,
-        dy,
-        &mut scratch_pos,
-        &mut scratch_neg,
-        &rmask,
-    );
+    let layout = RowLayout { map_y, wpr, rmask: &rmask };
+    dilate2d_into(&mut out_data, src, &layout, dx, dy, &mut scratch);
 
     Bitboard2D {
         data: out_data,
@@ -247,27 +251,24 @@ pub(crate) fn dilate3d(bb: &Bitboard3D, dx: u32, dy: u32, dt: u32) -> Bitboard3D
     let layer_stride = bb.layer_stride();
     let rmask = row_mask(map_x);
 
-    // Allocate: output buffer + temp (post-XY) + 2 scratch row-buffers.
+    // Allocate: output buffer + temp (post-XY) + shared scratch row-buffers.
     // All shared across all theta layers — no per-layer allocation.
     let mut out = vec![0u64; bb.data().len()];
     let mut temp = vec![0u64; bb.data().len()];
-    let mut scratch_pos: Vec<u64> = Vec::with_capacity(wpr);
-    let mut scratch_neg: Vec<u64> = Vec::with_capacity(wpr);
+    let mut scratch = Scratch::default();
 
     // Step 1: XY dilate each layer into `temp`, reusing scratch buffers.
+    let layout = RowLayout { map_y, wpr, rmask: &rmask };
     for it in 0..n_theta {
         let layer_start = it * layer_stride;
         let src_layer = &bb.data()[layer_start..layer_start + layer_stride];
         dilate2d_into(
             &mut temp[layer_start..layer_start + layer_stride],
             src_layer,
-            map_y,
-            wpr,
+            &layout,
             dx,
             dy,
-            &mut scratch_pos,
-            &mut scratch_neg,
-            &rmask,
+            &mut scratch,
         );
     }
 
@@ -315,39 +316,37 @@ pub(crate) fn dilate3d(bb: &Bitboard3D, dx: u32, dy: u32, dt: u32) -> Bitboard3D
 // complement
 // ---------------------------------------------------------------------------
 
-pub(crate) fn complement2d(bb: &Bitboard2D) -> Bitboard2D {
-    let map_x = bb.map_x();
-    let map_y = bb.map_y() as usize;
-    let wpr = bb.words_per_row() as usize;
-    let rmask = row_mask(map_x);
-    let mut data = bb.data().to_vec();
-    for iy in 0..map_y {
-        for w in 0..wpr {
-            data[iy * wpr + w] = (!data[iy * wpr + w]) & rmask[w];
+/// In-place bitwise complement of every row, masked to valid bits via `rmask`.
+/// Row count is implied by `data.len() / wpr`, so this serves both 2-D
+/// (`map_y` rows) and 3-D (`n_theta * map_y` rows) boards.
+#[inline]
+pub(crate) fn complement_rows(data: &mut [u64], wpr: usize, rmask: &[u64]) {
+    for chunk in data.chunks_mut(wpr) {
+        for (w, word) in chunk.iter_mut().enumerate() {
+            *word = (!*word) & rmask[w];
         }
     }
+}
+
+pub(crate) fn complement2d(bb: &Bitboard2D) -> Bitboard2D {
+    let rmask = row_mask(bb.map_x());
+    let mut data = bb.data().to_vec();
+    complement_rows(&mut data, bb.words_per_row() as usize, &rmask);
     Bitboard2D {
         data,
-        map_x,
+        map_x: bb.map_x(),
         map_y: bb.map_y(),
         words_per_row: bb.words_per_row(),
     }
 }
 
 pub(crate) fn complement3d(bb: &Bitboard3D) -> Bitboard3D {
-    let map_x = bb.map_x();
-    let wpr = bb.words_per_row() as usize;
-    let rmask = row_mask(map_x);
-    let total_rows = (bb.n_theta() * bb.map_y()) as usize;
+    let rmask = row_mask(bb.map_x());
     let mut data = bb.data().to_vec();
-    for row in 0..total_rows {
-        for w in 0..wpr {
-            data[row * wpr + w] = (!data[row * wpr + w]) & rmask[w];
-        }
-    }
+    complement_rows(&mut data, bb.words_per_row() as usize, &rmask);
     Bitboard3D {
         data,
-        map_x,
+        map_x: bb.map_x(),
         map_y: bb.map_y(),
         n_theta: bb.n_theta(),
         words_per_row: bb.words_per_row(),

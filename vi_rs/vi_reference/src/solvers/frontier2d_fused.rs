@@ -219,59 +219,18 @@ pub(crate) fn final_policy_fused(
     nthreads: usize,
     skip_unreached: bool,
 ) -> Vec<Option<usize>> {
-    let (nx, ny, nt) = (g.nx, g.ny, g.nt);
-    let n = (nx * ny * nt) as usize;
-    let rows: Vec<i32> = (0..ny).collect();
-    let chunk = rows.len().div_ceil(nthreads).max(1);
-
-    let parts: Vec<Vec<(usize, Option<usize>)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = rows
-            .chunks(chunk)
-            .map(|band| {
-                scope.spawn(move || {
-                    let mut out: Vec<(usize, Option<usize>)> = Vec::new();
-                    for &iy in band {
-                        for ix in 0..nx {
-                            let pad_col = g.pad_col(ix, iy);
-                            let orig_col = (ix * nt + iy * (nt * nx)) as usize;
-                            for it in 0..nt {
-                                let pad_idx = (pad_col + it as i64) as usize;
-                                if !f.eval_ok[pad_idx]
-                                    || (skip_unreached && f.cp[pad_idx] == UNREACHED)
-                                {
-                                    continue;
-                                }
-                                let mut min_cost = MAX_COST;
-                                let mut min_action: Option<usize> = None;
-                                for (ai, per_theta) in g.precomp.iter().enumerate() {
-                                    let c = action_cost_fused(
-                                        f.cp.as_slice(),
-                                        &per_theta[it as usize],
-                                        pad_col,
-                                    );
-                                    if c < min_cost {
-                                        min_cost = c;
-                                        min_action = Some(ai);
-                                    }
-                                }
-                                out.push((orig_col + it as usize, min_action));
-                            }
-                        }
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    let mut opt = vec![None; n];
-    for part in parts {
-        for (orig, action) in part {
-            opt[orig] = action;
-        }
-    }
-    opt
+    super::final_policy_parallel(
+        g.nx,
+        g.ny,
+        g.nt,
+        g.mx,
+        g.my,
+        g.row_stride,
+        &g.precomp,
+        nthreads,
+        |pad_idx| !f.eval_ok[pad_idx] || (skip_unreached && f.cp[pad_idx] == UNREACHED),
+        |buckets, pad_col| action_cost_fused(f.cp.as_slice(), buckets, pad_col),
+    )
 }
 
 /// `frontier2d_par_unsafe` と同じ共有ポインタ束 (cand/changed、バリアで相分離)。

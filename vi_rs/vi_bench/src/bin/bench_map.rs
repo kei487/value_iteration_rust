@@ -203,7 +203,8 @@ fn occupancy_fractions(map: &PgmMap) -> (f64, f64, f64) {
 }
 
 /// Build a downsampled occupancy grid (row-major, `data[x + ow*y]`, y=0 at world
-/// origin). Vertical flip matches `pgm::build_penalty` / `make_goal_mask`.
+/// origin). The vertical flip puts grid row `iy = 0` at world `y = origin_y`
+/// (ROS stores occupancy bottom-up; PGM rows run top-down).
 /// Each output cell is `100` (blocked) if ANY source cell in its `scale×scale`
 /// block is an obstacle (conservative pooling), else `0` (free).
 fn build_occupancy(map: &PgmMap, scale: usize, unknown_as_obstacle: bool) -> (Vec<i8>, i32, i32) {

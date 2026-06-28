@@ -13,8 +13,9 @@
 //! `--smoke` は単一 8×8 Empty・budget=1 に潰し、CI でワイヤリングだけ検証する
 //! （budget=1 では収束しないのでゲートはスキップ）。
 //!
-//! `--parallel`: u64 ソルバは現状シリアルのみ。フラグは受け付けるが no-op
-//! （`make rs-bench-parallel` 互換のため残す）。
+//! `--parallel`: bench_summary が回す既定ソルバはシリアル実装なのでフラグは no-op
+//! （`make rs-bench-parallel` 互換のため受け付けるだけ）。マルチスレッド版
+//! (frontier2d_par* 系, std::thread ベース) は bench_map から直接選ぶ。
 
 use std::fs;
 use std::io::Write;
@@ -79,8 +80,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     smoke: bool,
 
-    /// Accepted for `make rs-bench-parallel` compatibility. u64 solvers are
-    /// serial-only, so this is a no-op (a note is printed when set).
+    /// Accepted for `make rs-bench-parallel` compatibility. bench_summary's
+    /// solver set is serial, so this is a no-op (a note is printed when set).
+    /// The multithreaded solvers (frontier2d_par* ) are driven via bench_map.
     #[arg(long, default_value_t = false)]
     parallel: bool,
 }
@@ -181,7 +183,7 @@ fn main() -> ExitCode {
     let mut args = Args::parse();
 
     if args.parallel {
-        eprintln!("note: --parallel is a no-op for u64 solvers (serial-only); proceeding serial");
+        eprintln!("note: --parallel is a no-op here (bench_summary's solver set is serial); proceeding serial");
     }
 
     if args.smoke {

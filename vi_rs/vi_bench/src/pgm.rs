@@ -1,5 +1,5 @@
-//! P5 (binary) PGM + ROS `map_server` YAML loader and occupancy → penalty
-//! conversion, used by the `bench_map` binary.
+//! P5 (binary) PGM + ROS `map_server` YAML loader and occupancy classification,
+//! used by the `bench_map` binary.
 //!
 //! vi_rs has no map loader of its own (the C host has `map_pgm.c`; the
 //! `vi_node` ROS bridge takes a pre-parsed `OccupancyGridView`). `bench_map`
@@ -16,10 +16,7 @@
 //! `occ = (255 - pixel) / 255` (with `negate` honoured) and classify against
 //! `occupied_thresh` / `free_thresh`.
 
-use ndarray::Array2;
 use std::path::Path;
-
-use vi_core::{Penalty, PENALTY_OBSTACLE};
 
 /// Per-cell occupancy class derived from a pixel value and the YAML thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,117 +235,6 @@ pub fn classify(pixel: u8, negate: bool, occupied_thresh: f64, free_thresh: f64)
     }
 }
 
-/// Build a `[height, width]` penalty field from a loaded map.
-///
-/// - The image is flipped vertically so that grid row `iy = 0` corresponds to
-///   world `y = origin_y` (ROS stores occupancy bottom-up; PGM rows run
-///   top-down). This keeps grid indices consistent with [`vi_core::make_goal_mask`].
-/// - Obstacles (and `Unknown` when `unknown_as_obstacle`) become
-///   [`PENALTY_OBSTACLE`]. Everything else starts at 0.
-/// - When `safety_radius_cells > 0`, free cells within that chessboard radius
-///   of an obstacle are raised to `safety_penalty` (kept below the obstacle
-///   sentinel).
-pub fn build_penalty(
-    map: &PgmMap,
-    unknown_as_obstacle: bool,
-    safety_radius_cells: usize,
-    safety_penalty: u16,
-) -> Array2<Penalty> {
-    let w = map.width;
-    let h = map.height;
-    let mut pen = Array2::<Penalty>::zeros((h, w));
-
-    for iy in 0..h {
-        let src_row = h - 1 - iy; // vertical flip
-        for ix in 0..w {
-            let pixel = map.pixels[src_row * w + ix];
-            let occ = classify(pixel, map.negate, map.occupied_thresh, map.free_thresh);
-            let is_obstacle = matches!(occ, Occupancy::Obstacle)
-                || (matches!(occ, Occupancy::Unknown) && unknown_as_obstacle);
-            if is_obstacle {
-                pen[[iy, ix]] = PENALTY_OBSTACLE;
-            }
-        }
-    }
-
-    if safety_radius_cells > 0 && safety_penalty > 0 {
-        dilate(&mut pen, safety_radius_cells, safety_penalty);
-    }
-
-    pen
-}
-
-/// Raise every free cell within `radius` chessboard cells of an obstacle to
-/// `value` (leaving existing obstacles and higher penalties untouched).
-fn dilate(pen: &mut Array2<Penalty>, radius: usize, value: u16) {
-    let (h, w) = pen.dim();
-    let r = radius as isize;
-    let snapshot = pen.clone();
-    for iy in 0..h {
-        for ix in 0..w {
-            if snapshot[[iy, ix]] == PENALTY_OBSTACLE {
-                continue;
-            }
-            let mut near = false;
-            'scan: for dy in -r..=r {
-                for dx in -r..=r {
-                    let ny = iy as isize + dy;
-                    let nx = ix as isize + dx;
-                    if ny < 0 || nx < 0 || ny >= h as isize || nx >= w as isize {
-                        continue;
-                    }
-                    if snapshot[[ny as usize, nx as usize]] == PENALTY_OBSTACLE {
-                        near = true;
-                        break 'scan;
-                    }
-                }
-            }
-            if near && pen[[iy, ix]] < value {
-                pen[[iy, ix]] = value;
-            }
-        }
-    }
-}
-
-/// Conservatively downsample a penalty field by an integer `scale`. Each
-/// output cell takes the **maximum** penalty of its `scale × scale` source
-/// block, so obstacles ([`PENALTY_OBSTACLE`] = `0xFFFF`) always dominate and
-/// are never erased by neighbouring free space. Output dims are
-/// `ceil(dim / scale)`. `scale == 1` returns a clone.
-pub fn downsample_penalty(pen: &Array2<Penalty>, scale: usize) -> Array2<Penalty> {
-    assert!(scale >= 1, "scale must be >= 1");
-    if scale == 1 {
-        return pen.clone();
-    }
-    let (h, w) = pen.dim();
-    let nh = h.div_ceil(scale);
-    let nw = w.div_ceil(scale);
-    let mut out = Array2::<Penalty>::zeros((nh, nw));
-    for oy in 0..nh {
-        for ox in 0..nw {
-            let mut m: Penalty = 0;
-            for dy in 0..scale {
-                let sy = oy * scale + dy;
-                if sy >= h {
-                    break;
-                }
-                for dx in 0..scale {
-                    let sx = ox * scale + dx;
-                    if sx >= w {
-                        break;
-                    }
-                    let v = pen[[sy, sx]];
-                    if v > m {
-                        m = v;
-                    }
-                }
-            }
-            out[[oy, ox]] = m;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,86 +337,5 @@ mod tests {
         // negate: occ = p/255. p=255 -> occ=1.0 -> obstacle.
         assert_eq!(classify(255, true, 0.65, 0.196), Occupancy::Obstacle);
         assert_eq!(classify(0, true, 0.65, 0.196), Occupancy::Free);
-    }
-
-    // --- Penalty build ---
-
-    fn map_from_pixels(w: usize, h: usize, pixels: Vec<u8>) -> PgmMap {
-        PgmMap {
-            width: w,
-            height: h,
-            resolution: 0.05,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            occupied_thresh: 0.65,
-            free_thresh: 0.196,
-            negate: false,
-            pixels,
-        }
-    }
-
-    #[test]
-    fn build_penalty_marks_black_as_obstacle() {
-        // 2x1: left black (obstacle), right white (free).
-        let map = map_from_pixels(2, 1, vec![0, 255]);
-        let pen = build_penalty(&map, true, 0, 0);
-        assert_eq!(pen[[0, 0]], PENALTY_OBSTACLE);
-        assert_eq!(pen[[0, 1]], 0);
-    }
-
-    #[test]
-    fn build_penalty_unknown_as_obstacle_toggle() {
-        let map = map_from_pixels(1, 1, vec![205]); // unknown
-        assert_eq!(build_penalty(&map, true, 0, 0)[[0, 0]], PENALTY_OBSTACLE);
-        assert_eq!(build_penalty(&map, false, 0, 0)[[0, 0]], 0);
-    }
-
-    #[test]
-    fn build_penalty_flips_vertically() {
-        // 1x2 image: row0 (top) = black, row1 (bottom) = white.
-        // After flip, grid row 0 (y=origin_y, bottom) = white = free,
-        // grid row 1 (top) = black = obstacle.
-        let map = map_from_pixels(1, 2, vec![0, 255]);
-        let pen = build_penalty(&map, true, 0, 0);
-        assert_eq!(pen[[0, 0]], 0, "bottom grid row is the white image row");
-        assert_eq!(pen[[1, 0]], PENALTY_OBSTACLE, "top grid row is the black image row");
-    }
-
-    #[test]
-    fn build_penalty_dilation_raises_neighbours() {
-        // 3x3 all free except center black. radius 1 -> 8 neighbours get safety_penalty.
-        let map = map_from_pixels(3, 3, vec![255, 255, 255, 255, 0, 255, 255, 255, 255]);
-        let pen = build_penalty(&map, true, 1, 500);
-        assert_eq!(pen[[1, 1]], PENALTY_OBSTACLE);
-        for (iy, ix) in [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2)] {
-            assert_eq!(pen[[iy, ix]], 500, "dilated cell ({iy},{ix})");
-        }
-    }
-
-    // --- Downsample ---
-
-    #[test]
-    fn downsample_scale1_is_clone() {
-        let map = map_from_pixels(2, 1, vec![0, 255]);
-        let pen = build_penalty(&map, true, 0, 0);
-        let ds = downsample_penalty(&pen, 1);
-        assert_eq!(ds, pen);
-    }
-
-    #[test]
-    fn downsample_obstacle_dominates_block() {
-        // 2x2 penalty, one obstacle in the block -> single output cell = obstacle.
-        let mut pen = Array2::<Penalty>::zeros((2, 2));
-        pen[[1, 1]] = PENALTY_OBSTACLE;
-        let ds = downsample_penalty(&pen, 2);
-        assert_eq!(ds.dim(), (1, 1));
-        assert_eq!(ds[[0, 0]], PENALTY_OBSTACLE);
-    }
-
-    #[test]
-    fn downsample_ceil_dims_for_non_multiple() {
-        let pen = Array2::<Penalty>::zeros((3, 5));
-        let ds = downsample_penalty(&pen, 2);
-        assert_eq!(ds.dim(), (2, 3)); // ceil(3/2)=2, ceil(5/2)=3
     }
 }

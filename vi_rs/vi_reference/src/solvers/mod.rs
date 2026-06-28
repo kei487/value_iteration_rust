@@ -72,6 +72,155 @@ pub(crate) fn seed_frontier_2d(vi: &ValueIterator) -> Bitboard2D {
     bb
 }
 
+/// 3D フロンティア反復の共通ドライバ。frontier3d / tau / topk / coarse_theta が共有する
+/// 「seed → (膨張 → 候補走査 → 減少セルを次フロンティアへ) を収束まで」という骨格を1箇所に
+/// まとめる。差分は候補セルごとの処理 `update(vi, ix, iy, it)` のみ。
+///
+/// `update` は候補セル `(ix,iy,it)` を評価し、値を下げた（=次フロンティアへ伝播すべき）なら
+/// `true` を返す。ドライバは `true` のセルだけを次フロンティアに入れ、`updates` を 1 加算する
+/// （この「更新 ⟺ 伝播」は全 frontier3d 系ソルバで成り立つ不変条件）。
+/// `(iters, updates, converged)` を返す（`converged` はフロンティアが空になったか）。
+pub(crate) fn frontier3d_driver<F>(vi: &mut ValueIterator, max_iter: u32, mut update: F) -> (u32, u64, bool)
+where
+    F: FnMut(&mut ValueIterator, u32, u32, u32) -> bool,
+{
+    let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+    let (mx, my, mt) = displacement(vi);
+    let (dx, dy, dt) = (mx as u32, my as u32, mt as u32);
+    let mut frontier = seed_frontier(vi);
+    let mut updates: u64 = 0;
+    let mut iters: u32 = 0;
+    while frontier.popcount() > 0 && iters < max_iter {
+        iters += 1;
+        let candidates = frontier.dilate(dx, dy, dt);
+        let mut new_frontier = Bitboard3D::new(nx as u32, ny as u32, nt as u32);
+        for (ix, iy, it) in candidates.enumerate() {
+            if update(vi, ix, iy, it) {
+                updates += 1;
+                new_frontier.set(ix, iy, it);
+            }
+        }
+        frontier = new_frontier;
+    }
+    (iters, updates, frontier.popcount() == 0)
+}
+
+/// 2D フロンティア反復の共通ドライバ。frontier2d / soa / pad が共有する「seed →
+/// (空間膨張 → 候補 (ix,iy) ごとに全 θ 層を再評価 → 更新があれば次フロンティアへ) を収束まで」
+/// の骨格をまとめる。差分は候補セルごとの処理 `cell(ix, iy)` のみ。
+///
+/// `cell` は候補セル `(ix,iy)` の全 θ 層を再評価し、**減少した θ 層の数**を返す（0 なら不変）。
+/// ドライバは戻り値が 1 以上のセルだけを次フロンティアに入れ、その数を `updates` に加算する。
+/// per-cell が読む状態 (vi / SoA 配列 / Padded) は呼び出し側がクロージャに閉じ込めるため、
+/// ドライバ自身は `vi` を借用しない（seed / displacement は呼び出し側が事前計算して渡す）。
+/// `(iters, updates, converged)` を返す。
+pub(crate) fn frontier2d_driver<F>(
+    nx: i32,
+    ny: i32,
+    seed: Bitboard2D,
+    dx: u32,
+    dy: u32,
+    max_iter: u32,
+    mut cell: F,
+) -> (u32, u64, bool)
+where
+    F: FnMut(u32, u32) -> u64,
+{
+    let mut frontier = seed;
+    let mut updates: u64 = 0;
+    let mut iters: u32 = 0;
+    while frontier.popcount() > 0 && iters < max_iter {
+        iters += 1;
+        let candidates = frontier.dilate(dx, dy);
+        let mut new_frontier = Bitboard2D::new(nx as u32, ny as u32);
+        for (ix, iy) in candidates.enumerate() {
+            let u = cell(ix, iy);
+            if u > 0 {
+                updates += u;
+                new_frontier.set(ix, iy);
+            }
+        }
+        frontier = new_frontier;
+    }
+    (iters, updates, frontier.popcount() == 0)
+}
+
+/// 収束後の最終 argmin パス（並列・読み取り専用）の共通実装。frontier2d_par /
+/// frontier2d_fused（および各々を呼ぶ par_unsafe / sparse）が共有する「全 (ix,iy,it) を
+/// 行バンド並列に走査し、free・非 final セルの optimal_action を argmin で確定する」骨格を
+/// まとめる。差分は評価対象判定 `skip(pad_idx)` とアクションコスト `cost(buckets, pad_col)` の2点。
+///
+/// `pad_col = (ix+mx)·nt + (iy+my)·row_stride`（`Padded`/`Geom` の `pad_col` と同一式）。
+/// `precomp[ai][it]` は `(action, source θ)` ごとの隣接 `(相対オフセット, prob)`。
+/// 返り値はオリジナル座標 index の `Vec<Option<usize>>`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn final_policy_parallel<S, C>(
+    nx: i32,
+    ny: i32,
+    nt: i32,
+    mx: i32,
+    my: i32,
+    row_stride: i64,
+    precomp: &[Vec<Vec<(i64, u64)>>],
+    nthreads: usize,
+    skip: S,
+    cost: C,
+) -> Vec<Option<usize>>
+where
+    S: Fn(usize) -> bool + Sync,
+    C: Fn(&[(i64, u64)], i64) -> u64 + Sync,
+{
+    let n = (nx * ny * nt) as usize;
+    let rows: Vec<i32> = (0..ny).collect();
+    let chunk = rows.len().div_ceil(nthreads).max(1);
+    let skip = &skip;
+    let cost = &cost;
+
+    let parts: Vec<Vec<(usize, Option<usize>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .chunks(chunk)
+            .map(|band| {
+                scope.spawn(move || {
+                    let mut out: Vec<(usize, Option<usize>)> = Vec::new();
+                    for &iy in band {
+                        for ix in 0..nx {
+                            let pad_col =
+                                (ix + mx) as i64 * nt as i64 + (iy + my) as i64 * row_stride;
+                            let orig_col = (ix * nt + iy * (nt * nx)) as usize;
+                            for it in 0..nt {
+                                let pad_idx = (pad_col + it as i64) as usize;
+                                if skip(pad_idx) {
+                                    continue;
+                                }
+                                let mut min_cost = MAX_COST;
+                                let mut min_action: Option<usize> = None;
+                                for (ai, per_theta) in precomp.iter().enumerate() {
+                                    let c = cost(&per_theta[it as usize], pad_col);
+                                    if c < min_cost {
+                                        min_cost = c;
+                                        min_action = Some(ai);
+                                    }
+                                }
+                                out.push((orig_col + it as usize, min_action));
+                            }
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut opt = vec![None; n];
+    for part in parts {
+        for (orig, action) in part {
+            opt[orig] = action;
+        }
+    }
+    opt
+}
+
 /// 到達可能とみなす total_cost 上限（compare.py の value>=1e6 境界と整合）。
 pub(crate) const REACH_THRESH: u64 = 1_000_000u64 * crate::params::PROB_BASE;
 
