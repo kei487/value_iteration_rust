@@ -24,7 +24,23 @@ use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_fused::{action_cost_fused, CpCells, Geom, UNREACHED};
 use super::frontier2d_par::n_threads;
-use super::{seed_frontier_2d, Bitboard2D};
+use super::{displacement, seed_frontier_2d, Bitboard2D};
+
+/// θ マスクを円環（周期 `nt`）で ±k 膨張する（`frontier2d_sparse::rot_dilate` と同一）。回転アクション
+/// は dix=diy=0 で自セルも窓に含むため、変化 θ から `circ(θ′−θ) ≤ mt` の θ を再評価対象に広げる。
+#[inline]
+fn rot_dilate(m: u64, k: i32, nt: i32) -> u64 {
+    let full: u64 = if nt >= 64 { u64::MAX } else { (1u64 << nt) - 1 };
+    let nt = nt as u32;
+    let mut acc = m;
+    let (mut l, mut r) = (m, m);
+    for _ in 0..k {
+        l = ((l << 1) | (l >> (nt - 1))) & full;
+        r = ((r >> 1) | (r << (nt - 1))) & full;
+        acc |= l | r;
+    }
+    acc
+}
 
 /// 1 ブロック = この本数のパディング行。複数ブロックに跨る gather を刺激しつつ、退避粒度を保つ。
 const BLOCK_ROWS: usize = 8;
@@ -375,15 +391,24 @@ fn relax_column(
     (changed, mn, mx, ups)
 }
 
-/// 列 (ix,iy) の全 θ を Bellman 更新し、減少分を `view` へ **in-place 原子書き込み**する（非同期
-/// G-S）。`relax_column` の並列版で、隣接は他スレッドの最新書き込みも見え得る（async = G-S 同等の
-/// 速い収束、Jacobi のような全列スナップショットの iters 増が無い）。列 (ix,iy) のセルの書き手は
-/// 常にこのスレッドだけ（frontier をチャンク分割し列を排他割り当て）なので競合書き込みは無い。
-/// 戻り値 `(更新後 min, 更新後 max, 減少 θ 数)`。窓ブロックは呼び出し前に `ensure_window` 済み前提。
-/// `mn`/`mx` は自列セルのみから集計（自列は単一書き手なので一貫読み）＝ `column_range` と同義。
-fn relax_column_async(view: &AtomicCpView, g: &Geom, ix: i32, iy: i32) -> (u64, u64, u64) {
+/// 列 (ix,iy) の `eval_mask` で立つ θ だけを Bellman 更新し、減少分を `view` へ **in-place 原子
+/// 書き込み**する（θ マスク疎評価 × 非同期 G-S）。`eval_mask` 外の θ は入力不変が保証されている
+/// （マスクは窓 OR + 円環膨張による依存集合の保守的上位集合）ので現在値のまま据え置く＝評価を省く。
+/// 隣接は他スレッドの最新書き込みも見え得る（async = G-S 同等の速い収束）。列 (ix,iy) のセルの
+/// 書き手は常にこのスレッドだけ（frontier をチャンク排他割り当て）なので競合書き込みは無い。
+/// 戻り値 `(更新後 min, 更新後 max, 減少 θ 数, 減少 θ マスク)`。`mn`/`mx` は**全 θ**から集計
+/// （非評価 θ は据え置き値で参入）＝ finalize の col_max 判定に使える真の列値域。窓ブロックは
+/// 呼び出し前に `ensure_window` 済み前提。
+fn relax_column_async_masked(
+    view: &AtomicCpView,
+    g: &Geom,
+    ix: i32,
+    iy: i32,
+    eval_mask: u64,
+) -> (u64, u64, u64, u64) {
     let pad_col = g.pad_col(ix, iy);
     let mut ups = 0u64;
+    let mut cmask = 0u64;
     let (mut mn, mut mx) = (MAX_COST, MAX_COST);
     let mut first = true;
     for it in 0..g.nt {
@@ -395,7 +420,8 @@ fn relax_column_async(view: &AtomicCpView, g: &Geom, ix: i32, iy: i32) -> (u64, 
         } else {
             cp_self.wrapping_sub(pen_self)
         };
-        let new_v = if view.eval_ok(pad_idx) {
+        let eval_this = (eval_mask >> it) & 1 == 1;
+        let new_v = if eval_this && view.eval_ok(pad_idx) {
             let mut min_cost = MAX_COST;
             for per_theta in g.precomp.iter() {
                 let c = action_cost_fused(view, &per_theta[it as usize], pad_col);
@@ -406,12 +432,13 @@ fn relax_column_async(view: &AtomicCpView, g: &Geom, ix: i32, iy: i32) -> (u64, 
             if min_cost < cur_v {
                 view.store(pad_idx, min_cost.wrapping_add(pen_self)); // in-place 原子書き込み。
                 ups += 1;
+                cmask |= 1u64 << it;
                 min_cost
             } else {
                 cur_v
             }
         } else {
-            cur_v // 非 eval（ゴール/障害）: 値は不変。
+            cur_v // 非評価 θ（マスク外）/ 非 eval（ゴール/障害）: 値は不変。
         };
         if new_v != MAX_COST {
             if first {
@@ -424,7 +451,7 @@ fn relax_column_async(view: &AtomicCpView, g: &Geom, ix: i32, iy: i32) -> (u64, 
             }
         }
     }
-    (mn, mx, ups)
+    (mn, mx, ups, cmask)
 }
 
 /// 列 (ix,iy) を final 化する。到達済みセルの (value, policy) を出力配列へ確定保存し（退避後に
@@ -594,13 +621,20 @@ fn converge_band_serial(
     }
 }
 
-/// 波内バンドを**並列非同期 Gauss–Seidel** で収束させる（`converge_band_serial` と同じ事後状態・
-/// 収束値、bit-exact）。`frontier2d_fused` と同じ async 方式: ① 直列で frontier 全列の窓ブロックを
-/// `ensure_window` 確保 ② 確保済みブロックの cp/pen/eval 生ポインタ表（`AtomicCpView`）を作り、各
-/// ワーカーが担当列チャンクを relax して cp を **in-place 原子書き込み**（隣接は他スレッドの最新値も
-/// 見え得る = G-S 同等の速い収束。Jacobi のような全列スナップショットの iters 増が無い）③ join 後に
-/// 直列で col_min/col_max/live/次フロンティアを構築（cp は②で確定済み）。列ごと単一書き手なので
-/// 同一セル競合は無く、固定点は単調降下で一意なため最終値は G-S と bit-exact（iters は非決定的）。
+/// 波内バンドを**並列非同期 Gauss–Seidel × θ マスク疎評価**で収束させる（`converge_band_serial`
+/// と同じ収束値、bit-exact）。`frontier2d_fused`/`frontier2d_sparse` の async + θマスクを out-of-core
+/// ブロックへ移植したもの。各ラウンド: ① 直列で frontier 全列の窓ブロックを `ensure_window` 確保
+/// ② 確保済みブロックの cp/pen/eval 生ポインタ表（`AtomicCpView`）を作り、各ワーカーが担当列を
+/// 評価して cp を **in-place 原子書き込み**。評価する θ は、窓 (±mx,±my) の前ラウンド変化マスクを
+/// OR gather → `rot_dilate(mt)` で得た依存集合だけ（`acc==0` の列は丸ごとスキップ）③ join 後に直列で
+/// col_min/col_max/live/変化マスク/次フロンティアを構築。
+///
+/// **波ごと初回フル評価**: `mask` は波の収束で自然にクリアされる（最終ラウンドは伝播変化ゼロ →
+/// store なし、前ラウンド分は zero 化）。各波の round 1 は `first=true` で全 θ を評価（依存集合の
+/// 保守的上位集合）し、マスクを育ててから round 2+ で疎評価に入る。マスク store は **in-band 変化**
+/// （`cmask!=0 && mn<t`）の列のみ＝バンド外変化（高値、in-band を下げられない=正コスト SSP）は
+/// 伝播させない。これにより評価集合は真の依存集合の保守的上位集合のままなので、「1 ラウンド丸ごと
+/// 無変化」での収束時に全 (cell,θ) が Bellman 整合 = 一意固定点 = 本家と bit-exact。
 #[allow(clippy::too_many_arguments)]
 fn converge_band_async(
     store: &mut BlockStore,
@@ -621,38 +655,65 @@ fn converge_band_async(
     live: &mut Vec<usize>,
     iters: &mut u32,
     total_updates: &mut u64,
+    mask: &mut [u64],
+    mw: usize,
+    mt: i32,
+    full_mask: u64,
 ) -> bool {
+    // 並列 compute がワーカーから返す 1 列分の結果 `(列index i, mn, mx, ups, 変化θマスク)`。
+    type ColEval = (usize, u64, u64, u64, u64);
     let cidx = |ix: i32, iy: i32| (iy * nx + ix) as usize;
-    loop {
+    let (mx, my, nt) = (g.mx, g.my, g.nt);
+    let midx = |ix: i32, iy: i32| (ix + mx) as usize + (iy + my) as usize * mw;
+    // 前ラウンドにマスクを立てたセル（次ラウンド冒頭でゼロ化する。波末でも掃除）。
+    let mut prev_cells: Vec<(u32, u32)> = Vec::new();
+    let mut first = true;
+    let outcome = loop {
         // ① 直列: frontier 全列の窓ブロックを確保（並列 compute 中は確保/退避できないため）。
         for &(ixu, iyu) in frontier.iter() {
             ensure_window(store, ixu as i32, iyu as i32, states);
         }
-        // ② 並列 async G-S compute（in-place 原子書き込み）。各列は 1 チャンク = 1 スレッドが排他
-        //    担当（単一書き手）。戻り値は列ごとの `(i, mn, mx, ups)`。view は store の生ポインタ表で、
-        //    本スコープ中は store を借用しない（確保/退避なし）ので alias 問題は無い。
+        // ② 並列 async G-S × θ疎評価。各列は 1 チャンク = 1 スレッドが排他担当（単一書き手）。
+        //    戻り値は評価した列の `(i, mn, mx, ups, cmask)`。view/mask は本スコープ中 store を
+        //    可変借用しない（確保/退避なし）。mask は読み取り専用（書きは③直列）。
         let view = store.atomic_view();
-        // フロンティアが薄いラウンドでは、過剰なスレッド spawn（毎ラウンド再 spawn）を避けるため
-        // 1 スレッドあたり最低 MIN_COLS_PER_THREAD 列を割り当てる範囲に実効スレッド数を抑える。
         const MIN_COLS_PER_THREAD: usize = 64;
         let eff = nthreads.min((frontier.len() / MIN_COLS_PER_THREAD).max(1));
         let chunk = frontier.len().div_ceil(eff).max(1);
-        let results: Vec<Vec<(usize, u64, u64, u64)>> = {
+        let results: Vec<Vec<ColEval>> = {
             let view_ref = &view;
+            let mask_ref: &[u64] = mask;
             std::thread::scope(|scope| {
                 let handles: Vec<_> = frontier
                     .chunks(chunk)
                     .map(|part| {
                         scope.spawn(move || {
-                            let mut out: Vec<(usize, u64, u64, u64)> = Vec::new();
+                            let mut out: Vec<ColEval> = Vec::new();
                             for &(ixu, iyu) in part {
-                                let i = (iyu as i32 * nx + ixu as i32) as usize;
+                                let (ix, iy) = (ixu as i32, iyu as i32);
+                                let i = (iy * nx + ix) as usize;
                                 if col_final[i] {
                                     continue;
                                 }
-                                let (mn, mx, ups) =
-                                    relax_column_async(view_ref, g, ixu as i32, iyu as i32);
-                                out.push((i, mn, mx, ups));
+                                // θ マスク gather: 窓 (±mx,±my) の前ラウンド変化マスクを OR。
+                                let eval_mask = if first {
+                                    full_mask // 波初回はマスク未育成 → 全 θ（保守的）。
+                                } else {
+                                    let mut acc = 0u64;
+                                    for dy2 in -my..=my {
+                                        let base = ix as usize + (iy + dy2 + my) as usize * mw;
+                                        for k in 0..(2 * mx + 1) as usize {
+                                            acc |= mask_ref[base + k];
+                                        }
+                                    }
+                                    if acc == 0 {
+                                        continue; // 依存入力に変化なし → 列ごとスキップ。
+                                    }
+                                    rot_dilate(acc, mt, nt)
+                                };
+                                let (mn, mx_, ups, cmask) =
+                                    relax_column_async_masked(view_ref, g, ix, iy, eval_mask);
+                                out.push((i, mn, mx_, ups, cmask));
                             }
                             out
                         })
@@ -661,42 +722,53 @@ fn converge_band_async(
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         };
-        drop(view); // 生ポインタ表を破棄してから store を可変借用する。
-        // ③ 直列 apply: col_min/col_max/live/次フロンティア構築（cp は②で確定済み）。
+        drop(view); // 生ポインタ表を破棄してから store/mask を可変アクセスする。
+        // ③ 直列 apply: 前ラウンドのマスクをゼロ化 → 今ラウンドの in-band 変化マスクを store。
+        for &(x, y) in &prev_cells {
+            mask[midx(x as i32, y as i32)] = 0;
+        }
+        prev_cells.clear();
         let mut changed = Bitboard2D::new(nx as u32, ny as u32);
         let mut any = false;
         for part in &results {
-            for &(i, mn, mx, ups) in part {
+            for &(i, mn, mx_, ups, cmask) in part {
                 col_min[i] = mn;
-                col_max[i] = mx;
+                col_max[i] = mx_;
                 if mn != MAX_COST && !reached[i] {
                     reached[i] = true;
                     live.push(i);
                 }
                 *total_updates += ups;
-                if ups > 0 {
+                // in-band 変化のみ伝播（バンド外＝高値は in-band を下げられない＝正コスト SSP）。
+                if cmask != 0 && mn != MAX_COST && mn < t {
                     any = true;
-                }
-                if mn != MAX_COST && mn < t {
-                    let ix = (i % nx as usize) as u32;
-                    let iy = (i / nx as usize) as u32;
-                    changed.set(ix, iy);
+                    let ix = (i % nx as usize) as i32;
+                    let iy = (i / nx as usize) as i32;
+                    mask[midx(ix, iy)] = cmask;
+                    prev_cells.push((ix as u32, iy as u32));
+                    changed.set(ix as u32, iy as u32);
                 }
             }
         }
+        first = false;
         *iters += 1;
         if *iters >= max_iter {
-            return false;
+            break false;
         }
         if !any {
-            return true;
+            break true;
         }
         *frontier = changed
             .dilate(dx, dy)
             .enumerate()
             .filter(|&(ixu, iyu)| !col_final[cidx(ixu as i32, iyu as i32)])
             .collect();
+    };
+    // 波末: 残った変化マスクをゼロ化して次の波に持ち越さない（収束時はほぼ空、max_iter 時も掃除）。
+    for &(x, y) in &prev_cells {
+        mask[midx(x as i32, y as i32)] = 0;
     }
+    outcome
 }
 
 /// セット済み `ValueIterator` をブロックタイル・アウトオブコアで解く。
@@ -749,6 +821,18 @@ pub(crate) fn solve_compact_into_nthreads(
 
     let halo_blocks = (g.my as usize).div_ceil(BLOCK_ROWS);
 
+    // θ マスク疎評価（並列 async 経路のみ）。変化 θ ビットマスク (u64) の padding 付き 2D 配列。
+    // O(ncol) u64（cp の 1/nt）で、compact が常駐させる col_* 配列と同オーダー。`mt` は θ 円環膨張半径。
+    let mt = displacement(vi).2;
+    assert!(g.nt <= 64, "θ マスクは u64 前提 (nt={})", g.nt);
+    let mw = (nx + 2 * g.mx) as usize;
+    let full_mask: u64 = if g.nt >= 64 { u64::MAX } else { (1u64 << g.nt) - 1 };
+    let mut mask: Vec<u64> = if nthreads >= 2 {
+        vec![0u64; mw * (ny + 2 * g.my) as usize]
+    } else {
+        Vec::new() // 直列 G-S 経路は θ マスクを使わない。
+    };
+
     let mut iters = 0u32;
     let mut total_updates = 0u64;
     let mut finalized = 0u64;
@@ -792,12 +876,13 @@ pub(crate) fn solve_compact_into_nthreads(
     let mut t = band;
     let converged = 'outer: loop {
         // ── 波: バンド [.., t) を収束。relax は隣接（未到達含む）を発見、伝播は in-band 列のみ。
-        //    nthreads==1 は直列 G-S、>=2 は並列 Jacobi。max_iter 到達なら 'outer を false で抜ける。 ──
+        //    nthreads==1 は直列 G-S、>=2 は並列 async G-S × θマスク疎評価。max_iter 到達なら
+        //    'outer を false で抜ける。 ──
         let band_ok = if nthreads >= 2 {
             converge_band_async(
                 &mut store, &g, states, nthreads, nx, ny, dx, dy, t, max_iter, &mut frontier,
                 &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
-                &mut total_updates,
+                &mut total_updates, &mut mask, mw, mt, full_mask,
             )
         } else {
             converge_band_serial(
@@ -1028,6 +1113,38 @@ mod tests {
             "band should bound resident (peak={}, reachable_cols={}, band={})",
             stats.peak_resident_cols, stats.reachable_cols, band
         );
+    }
+
+    /// θ マスク疎評価 × 値バンド × 退避を **nthreads=4 固定**で同時に刺激し bit-exact を確認。
+    /// 小バンド（多波）＋縦長マップで「波ごとマスク育成→疎評価→波末クリア→再活性」の往復と、
+    /// θ マスク gather/rot_dilate/acc==0 スキップを機械のコア数に依らず決定的に踏む。
+    #[test]
+    fn theta_mask_band_eviction_parallel_exact() {
+        use crate::params::PROB_BASE;
+        use crate::solvers::test_support::{make_vi, run_reference_to_fixed_point, REACH};
+        let (w, h) = (16, 96);
+        let occ = vec![0i8; (w * h) as usize];
+        let mut a = make_vi(w, h, occ.clone());
+        let mut b = make_vi(w, h, occ);
+        run_reference_to_fixed_point(&mut a);
+
+        let mut sink = RamSink::new(b.states.len());
+        let s = solve_compact_into_nthreads(&mut b, 30000, Some(PROB_BASE), &mut sink, 4);
+        assert!(s.converged, "must converge (θ-mask + band, parallel)");
+        let mut mism = 0u64;
+        for i in 0..a.states.len() {
+            if a.states[i].total_cost < REACH {
+                if a.states[i].total_cost != b.states[i].total_cost {
+                    mism += 1;
+                }
+                assert_eq!(
+                    a.states[i].optimal_action, b.states[i].optimal_action,
+                    "policy mismatch @ state {i}"
+                );
+            }
+        }
+        assert_eq!(mism, 0, "θ-mask sparse eval must stay bit-exact under band scan");
+        assert!(s.freed_blocks > 0, "退避が起きるべき（多波・小バンド）");
     }
 
     /// 遅延確保＋退避が peak RAM（常駐ブロック）を band に抑え、かつ出力経由で bit-exact。
