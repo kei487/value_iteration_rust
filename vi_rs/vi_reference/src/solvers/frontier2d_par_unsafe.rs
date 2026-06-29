@@ -28,15 +28,14 @@
 //!
 //! `optimal_action` は収束後の最終 argmin パス（`frontier2d_par::final_policy`、並列・読み取り専用）で確定。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Barrier;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::params::MAX_COST;
 use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_pad::{action_cost_pad, Padded};
 use super::frontier2d_par::{final_policy, n_threads};
-use super::{seed_frontier_2d, Bitboard2D};
+use super::{async_gs_engine, seed_frontier_2d};
 
 // AtomicU64 は u64 と同一のメモリ表現を持つ (std ドキュメント保証) — `Vec<[u64; 2]>` を
 // `&[[AtomicU64; 2]]` として再解釈する前提をコンパイル時に固定する。
@@ -45,25 +44,11 @@ const _: () = assert!(
         && std::mem::align_of::<[AtomicU64; 2]>() == std::mem::align_of::<[u64; 2]>()
 );
 
-/// スレッド間で共有する生ポインタ束。永続ワーカーが Copy で持つ。
-///
-/// - `cand`: 今ラウンドの候補セルリスト。リーダーが B1〜B2 間で差し替え、ワーカーは
-///   compute 相でのみ読む — バリアが happens-before を与えるのでデータレースではない。
-/// - `changed`: 長さ `nthreads` の配列の先頭。compute 相ではワーカー `w` が `changed[w]` のみ
-///   に書き（排他）、B1 後のリーダー直列相でのみ全要素を読む。
-///
-/// (`hot` はここに含めない — `[[AtomicU64; 2]]` の共有スライスとして普通に渡る。)
-#[derive(Clone, Copy)]
-struct Shared {
-    cand: *mut Vec<(u32, u32)>,
-    changed: *mut Vec<(u32, u32)>,
-}
-// SAFETY: 上記のとおり全アクセスはバリアで相分離され、「単一書き手 + バリア後読み」の規律を守る。
-unsafe impl Send for Shared {}
-unsafe impl Sync for Shared {}
-
 /// セット済み `ValueIterator` を非同期 (Gauss-Seidel) unsafe 並列 frontier2d で解く。
 /// `(iters, updates, converged)`。到達可能セルの収束値・方策は安全版と bit-exact。
+///
+/// 並列骨格 (永続スレッド + バリア×2 + work-stealing + リーダーの次フロンティア再構築) は
+/// [`super::async_gs_engine`] が担い、ここでは pad モデル固有の per-cell 評価だけを与える。
 pub fn frontier2d_par_unsafe_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
     let mut m = Padded::build(vi);
     let (nx, ny, nt) = (m.nx, m.ny, m.nt);
@@ -72,162 +57,51 @@ pub fn frontier2d_par_unsafe_solve(vi: &mut ValueIterator, max_iter: u32) -> (u3
 
     // hot を Padded から取り出し、atomic ビューで共有する（&m の不変借用と両立させるため分離）。
     // SAFETY: [AtomicU64; 2] は [u64; 2] とサイズ/アライン一致 (冒頭の const assert)。
-    // scope 終了まで hot 本体には触れず、全アクセスはこのビュー経由の Relaxed load/store。
+    // engine 終了まで hot 本体には触れず、全アクセスはこのビュー経由の Relaxed load/store。
     let mut hot: Vec<[u64; 2]> = std::mem::take(&mut m.hot);
     let n_pad = hot.len();
     let hot_atomic: &[[AtomicU64; 2]] =
         unsafe { std::slice::from_raw_parts(hot.as_mut_ptr().cast::<[AtomicU64; 2]>(), n_pad) };
 
-    // 初期候補 = dilate(seed)。以降はリーダーが changed から再構築する。
-    let mut cand_list: Vec<(u32, u32)> =
-        seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
-    let mut changed_lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nthreads];
-
-    let shared = Shared {
-        cand: &mut cand_list as *mut Vec<(u32, u32)>,
-        changed: changed_lists.as_mut_ptr(),
-    };
-
-    let barrier = Barrier::new(nthreads);
-    let done = AtomicBool::new(false);
-    let iters_out = AtomicU32::new(0);
-    let converged_out = AtomicBool::new(false);
-    // work-stealing カーソル: 候補リストを BLOCK 件単位で fetch_add により動的分配する。
-    // 静的チャンクだと障害物近傍 (action_cost_pad が即 return) ばかりのチャンクが早く終わり
-    // 負荷不均衡になる。各ブロックの claim は一意なので「セルの書き手は 1 スレッド」は保たれる。
-    let cursor = AtomicUsize::new(0);
+    let cand_list: Vec<(u32, u32)> = seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
     let m_ref = &m;
 
-    // 全ワーカーの累積更新数を合算して updates とする（per-(cell,theta) の減少回数）。
-    let total_updates: u64 = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|w| {
-                let barrier = &barrier;
-                let done = &done;
-                let iters_out = &iters_out;
-                let converged_out = &converged_out;
-                let cursor = &cursor;
-                scope.spawn(move || -> u64 {
-                    // `Shared` 全体を再束縛してクロージャに「構造体まるごと」をキャプチャさせる
-                    // (Rust 2021 のフィールド分割キャプチャだと生ポインタ単体が捕まり Send にならない)。
-                    // clippy::redundant_locals は分割キャプチャ回避という意味を解さないので抑制する。
-                    #[allow(clippy::redundant_locals)]
-                    let shared = shared;
-                    let mut my_updates: u64 = 0;
-                    let mut iter_count: u32 = 0;
-                    loop {
-                        // ── compute (並列・in-place 非同期書き込み) ──
-                        // SAFETY (cand): リーダーの差し替えは B1〜B2 間のみ、ここは B2 後の
-                        // compute 相 — バリアの happens-before で可視・無競合。
-                        let cand = unsafe { &*shared.cand };
-                        let n = cand.len();
-                        // SAFETY: ワーカー w は changed[w] だけを触る（他スレッドと排他）。
-                        let my_changed = unsafe { &mut *shared.changed.add(w) };
-                        my_changed.clear();
+    // per-cell 評価 (pad モデル): 全 θ を Bellman 更新し、(減少した θ があるか, 減少 θ 層数) を返す。
+    // 自セルは単一書き手なので before は最新値 (Relaxed で十分)。
+    let eval = |ix: i32, iy: i32| -> (bool, u64) {
+        let pad_col = m_ref.pad_col(ix, iy);
+        let mut cell_changed = false;
+        let mut ups = 0u64;
+        for it in 0..nt {
+            let pad_idx = (pad_col + it as i64) as usize;
+            if !m_ref.free[pad_idx] || m_ref.finals[pad_idx] {
+                continue;
+            }
+            let before = hot_atomic[pad_idx][0].load(Ordering::Relaxed);
+            let mut min_cost = MAX_COST;
+            for per_theta in m_ref.precomp.iter() {
+                let c = action_cost_pad(hot_atomic, &m_ref.free, &per_theta[it as usize], pad_col);
+                if c < min_cost {
+                    min_cost = c;
+                }
+            }
+            if min_cost < before {
+                hot_atomic[pad_idx][0].store(min_cost, Ordering::Relaxed);
+                ups += 1;
+                cell_changed = true;
+            }
+        }
+        (cell_changed, ups)
+    };
 
-                        // work stealing: BLOCK 件の連続ブロックを fetch_add で claim する
-                        // (連続なので行方向の cache 局所性は静的チャンクと同等)。
-                        const BLOCK: usize = 16;
-                        loop {
-                            let s = cursor.fetch_add(BLOCK, Ordering::Relaxed);
-                            if s >= n {
-                                break;
-                            }
-                            let e = (s + BLOCK).min(n);
-                            for &(ixu, iyu) in &cand[s..e] {
-                                let (ix, iy) = (ixu as i32, iyu as i32);
-                                let pad_col = m_ref.pad_col(ix, iy);
-                                let mut cell_changed = false;
-                                for it in 0..nt {
-                                    let pad_idx = (pad_col + it as i64) as usize;
-                                    if !m_ref.free[pad_idx] || m_ref.finals[pad_idx] {
-                                        continue;
-                                    }
-                                    // 自セルは単一書き手なので before は最新値 (Relaxed で十分)。
-                                    let before = hot_atomic[pad_idx][0].load(Ordering::Relaxed);
-                                    let mut min_cost = MAX_COST;
-                                    for per_theta in m_ref.precomp.iter() {
-                                        let c = action_cost_pad(
-                                            hot_atomic,
-                                            &m_ref.free,
-                                            &per_theta[it as usize],
-                                            pad_col,
-                                        );
-                                        if c < min_cost {
-                                            min_cost = c;
-                                        }
-                                    }
-                                    if min_cost < before {
-                                        // claim したブロック内のセル = 単一書き手。
-                                        hot_atomic[pad_idx][0].store(min_cost, Ordering::Relaxed);
-                                        my_updates += 1;
-                                        cell_changed = true;
-                                    }
-                                }
-                                if cell_changed {
-                                    my_changed.push((ixu, iyu));
-                                }
-                            }
-                        }
-
-                        barrier.wait(); // B1: 全 hot/changed 書き込みが可視。
-
-                        // ── リーダー直列: changed → 次フロンティア再構築 / 終了判定 ──
-                        if w == 0 {
-                            iter_count += 1;
-                            let mut any = false;
-                            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
-                            for i in 0..nthreads {
-                                // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
-                                let cl = unsafe { &*shared.changed.add(i) };
-                                if !cl.is_empty() {
-                                    any = true;
-                                }
-                                for &(ixu, iyu) in cl {
-                                    nf.set(ixu, iyu);
-                                }
-                            }
-                            if any && iter_count < max_iter {
-                                let mut next: Vec<(u32, u32)> =
-                                    nf.dilate(dx, dy).enumerate().collect();
-                                // 対称 Gauss-Seidel 風: 走査方向をラウンドごとに反転すると、
-                                // 行順走査と逆向きの値伝播も同一ラウンド内で連鎖する。
-                                if iter_count % 2 == 1 {
-                                    next.reverse();
-                                }
-                                // SAFETY: 他ワーカーは B1〜B2 間 cand を読まない。
-                                unsafe {
-                                    *shared.cand = next;
-                                }
-                                // 次ラウンドの work-stealing カーソルを巻き戻す (B2 で可視化)。
-                                cursor.store(0, Ordering::Relaxed);
-                                // done は false のまま（次ラウンドへ）。
-                            } else {
-                                iters_out.store(iter_count, Ordering::Relaxed);
-                                converged_out.store(!any, Ordering::Relaxed);
-                                done.store(true, Ordering::Relaxed);
-                            }
-                        }
-
-                        barrier.wait(); // B2: リーダーの cand 差し替え / done が可視。
-                        if done.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    my_updates
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
-    });
+    let (iters, total_updates, converged) =
+        async_gs_engine(nx, ny, dx, dy, nthreads, max_iter, cand_list, eval);
 
     // hot を Padded へ戻し、収束値から optimal_action を確定して書き戻す。
     m.hot = hot;
     let opt = final_policy(&m, nthreads);
     m.write_back(vi, Some(&opt));
 
-    let iters = iters_out.load(Ordering::Relaxed);
-    let converged = converged_out.load(Ordering::Relaxed);
     (iters, total_updates, converged)
 }
 

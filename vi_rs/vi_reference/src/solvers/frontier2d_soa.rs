@@ -13,7 +13,7 @@ use crate::params::{MAX_COST, PROB_BASE_BIT};
 use crate::state_transition::StateTransition;
 use crate::value_iterator::ValueIterator;
 
-use super::{displacement, seed_frontier_2d, Bitboard2D};
+use super::{displacement, frontier2d_driver, seed_frontier_2d};
 
 /// 本家 `actionCost` の SoA 版。`trans` はソースセルの θ の遷移リスト。
 #[inline]
@@ -65,18 +65,13 @@ pub fn frontier2d_soa_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
     let mut opt: Vec<Option<usize>> = vi.states.iter().map(|s| s.optimal_action).collect();
 
     let (mx, my, _mt) = displacement(vi);
-    let (dx, dy) = (mx as u32, my as u32);
-    let mut frontier = seed_frontier_2d(vi);
-    let mut updates: u64 = 0;
-    let mut iters: u32 = 0;
+    let seed = seed_frontier_2d(vi);
+    let actions = &vi.actions;
 
-    while frontier.popcount() > 0 && iters < max_iter {
-        iters += 1;
-        let candidates = frontier.dilate(dx, dy);
-        let mut new_frontier = Bitboard2D::new(nx as u32, ny as u32);
-        for (ixu, iyu) in candidates.enumerate() {
+    let (iters, updates, converged) =
+        frontier2d_driver(nx, ny, seed, mx as u32, my as u32, max_iter, |ixu, iyu| {
             let (ix, iy) = (ixu as i32, iyu as i32);
-            let mut changed = false;
+            let mut upd = 0u64;
             for it in 0..nt {
                 let idx = (it + ix * nt + iy * (nt * nx)) as usize;
                 // 本家 valueIteration: 非 free / final_state は更新しない。
@@ -86,7 +81,7 @@ pub fn frontier2d_soa_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
                 let before = hot[idx][0];
                 let mut min_cost = MAX_COST;
                 let mut min_action: Option<usize> = None;
-                for (ai, a) in vi.actions.iter().enumerate() {
+                for (ai, a) in actions.iter().enumerate() {
                     let c = action_cost_soa(
                         &hot,
                         &free,
@@ -105,23 +100,18 @@ pub fn frontier2d_soa_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
                 hot[idx][0] = min_cost;
                 opt[idx] = min_action;
                 if min_cost < before {
-                    updates += 1;
-                    changed = true;
+                    upd += 1;
                 }
             }
-            if changed {
-                new_frontier.set(ixu, iyu);
-            }
-        }
-        frontier = new_frontier;
-    }
+            upd
+        });
 
     // ── 結果を vi.states へ書き戻し (ハーネス出力・parity 比較が読む)。──
     for (i, s) in vi.states.iter_mut().enumerate() {
         s.total_cost = hot[i][0];
         s.optimal_action = opt[i];
     }
-    (iters, updates, frontier.popcount() == 0)
+    (iters, updates, converged)
 }
 
 #[cfg(test)]

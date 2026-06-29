@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::params::{MAX_COST, PROB_BASE_BIT};
 use crate::value_iterator::ValueIterator;
 
-use super::{displacement, seed_frontier_2d, Bitboard2D};
+use super::{displacement, frontier2d_driver, seed_frontier_2d};
 
 /// `hot` 配列の読み出し抽象。直列/Jacobi 版は素の `[[u64; 2]]` スライス、非同期版
 /// (`frontier2d_par_unsafe`) は Relaxed atomic ビューを渡す。Relaxed load は
@@ -160,23 +160,17 @@ pub(crate) fn action_cost_pad<H: HotCells + ?Sized>(
 /// セット済み `ValueIterator` を Frontier2D-pad で収束まで解く。`(iters, updates, converged)`。
 pub fn frontier2d_pad_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
     let mut m = Padded::build(vi);
-    let (nx, nt) = (m.nx, m.nt);
+    let (nx, ny, nt, mx, my) = (m.nx, m.ny, m.nt, m.mx, m.my);
 
     let mut opt: Vec<Option<usize>> = vi.states.iter().map(|s| s.optimal_action).collect();
-    let (dx, dy) = (m.mx as u32, m.my as u32);
-    let mut frontier = seed_frontier_2d(vi);
-    let mut updates: u64 = 0;
-    let mut iters: u32 = 0;
+    let seed = seed_frontier_2d(vi);
 
-    while frontier.popcount() > 0 && iters < max_iter {
-        iters += 1;
-        let candidates = frontier.dilate(dx, dy);
-        let mut new_frontier = Bitboard2D::new(m.nx as u32, m.ny as u32);
-        for (ixu, iyu) in candidates.enumerate() {
+    let (iters, updates, converged) =
+        frontier2d_driver(nx, ny, seed, mx as u32, my as u32, max_iter, |ixu, iyu| {
             let (ix, iy) = (ixu as i32, iyu as i32);
             let orig_col = (ix * nt + iy * (nt * nx)) as usize;
             let pad_col = m.pad_col(ix, iy);
-            let mut changed = false;
+            let mut upd = 0u64;
             for it in 0..nt {
                 let pad_idx = (pad_col + it as i64) as usize;
                 if !m.free[pad_idx] || m.finals[pad_idx] {
@@ -196,19 +190,14 @@ pub fn frontier2d_pad_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
                 m.hot[pad_idx][0] = min_cost;
                 opt[orig_col + it as usize] = min_action;
                 if min_cost < before {
-                    updates += 1;
-                    changed = true;
+                    upd += 1;
                 }
             }
-            if changed {
-                new_frontier.set(ixu, iyu);
-            }
-        }
-        frontier = new_frontier;
-    }
+            upd
+        });
 
     m.write_back(vi, Some(&opt));
-    (iters, updates, frontier.popcount() == 0)
+    (iters, updates, converged)
 }
 
 #[cfg(test)]

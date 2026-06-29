@@ -78,27 +78,48 @@ impl Snapshotter {
         let t_sec = (self.t0.elapsed() - self.overhead).as_secs_f64();
         let started = Instant::now();
         let (nx, ny, nt) = (g.nx, g.ny, g.nt);
-        let mut buf = Vec::<u8>::with_capacity((nx * ny) as usize * 4);
-        for iy in 0..ny {
-            for ix in 0..nx {
-                let col = g.pad_col(ix, iy);
-                let mut best = UNREACHED;
-                for it in 0..nt {
-                    let v = cp[(col + it as i64) as usize].load(Ordering::Relaxed);
-                    if v != UNREACHED {
-                        let val = v.wrapping_sub(pen[(col + it as i64) as usize]);
-                        if val < best {
-                            best = val;
+        let nxu = nx as usize;
+        // min-θ 値場 (f32 秒) を行バンド並列で構築。dump はリーダー直列相で呼ばれ他ワーカーは
+        // バリア待機中なので、ここで一時スレッドを起こしアイドルコアを使う (627M セル走査が
+        // 単一コアだと scale3 で 1 回 ~4 s かかり wall-clock を支配するため)。
+        let mut field = vec![0f32; nxu * ny as usize];
+        let nthr = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, ny.max(1) as usize);
+        let rows_per = (ny as usize).div_ceil(nthr);
+        std::thread::scope(|s| {
+            for (band, chunk) in field.chunks_mut(rows_per * nxu).enumerate() {
+                let iy0 = (band * rows_per) as i32;
+                s.spawn(move || {
+                    let rows = (chunk.len() / nxu) as i32;
+                    for r in 0..rows {
+                        let iy = iy0 + r;
+                        for ix in 0..nx {
+                            let col = g.pad_col(ix, iy);
+                            let mut best = UNREACHED;
+                            for it in 0..nt {
+                                let v = cp[(col + it as i64) as usize].load(Ordering::Relaxed);
+                                if v != UNREACHED {
+                                    let val = v.wrapping_sub(pen[(col + it as i64) as usize]);
+                                    if val < best {
+                                        best = val;
+                                    }
+                                }
+                            }
+                            chunk[r as usize * nxu + ix as usize] = if best == UNREACHED {
+                                f32::INFINITY
+                            } else {
+                                (best as f64 / PROB_BASE as f64) as f32
+                            };
                         }
                     }
-                }
-                let f = if best == UNREACHED {
-                    f32::INFINITY
-                } else {
-                    (best as f64 / PROB_BASE as f64) as f32
-                };
-                buf.extend_from_slice(&f.to_le_bytes());
+                });
             }
+        });
+        let mut buf = Vec::<u8>::with_capacity(nxu * ny as usize * 4);
+        for f in &field {
+            buf.extend_from_slice(&f.to_le_bytes());
         }
         let path = format!("{}/snap_{:05}.bin", self.dir, self.idx);
         if std::fs::write(&path, &buf).is_ok() {
@@ -122,7 +143,6 @@ unsafe impl Sync for Shared {}
 /// セット済み `ValueIterator` を θ疎評価 + penalty 融合 + 非同期 G-S 並列で解く。
 /// `(iters, updates, converged)`。到達可能セルの収束値・方策は本家と bit-exact。
 pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
-    let t_solve0 = Instant::now();
     let g = Geom::build(vi);
     let (nx, ny, nt) = (g.nx, g.ny, g.nt);
     assert!(nt <= 64, "θマスクは u64 前提 (nt={nt})");
@@ -132,6 +152,18 @@ pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u
     let nthreads = n_threads();
 
     let mut f = Fused::build_direct(vi, &g);
+
+    // 低メモリ動画モード (`VI_SNAP_DROP_STATES=1`)。`Fused` は cp/pen/eval_ok を独立所有し、
+    // 以降スイープ本体も Snapshotter も `vi.states` を一切参照しない (snapshot は cp/pen から
+    // 直接ダンプ)。巨大マップ (例 tsukuba 0.15m = 4417×2367×60 ≈ 627M states ≈ 35 GB) では
+    // states を抱えたままだと cp/pen と合わせ RAM を超えるため、初期フロンティアの
+    // 種付け (seed_frontier_2d) 直後に解放する (フラグだけここで読む)。
+    // 解放すると末尾の write_back / policy は不能になるので、両方スキップする
+    // (動画は snapshot 出力で完結し、収束値は cp/pen 側に保持される)。
+    let drop_states = std::env::var("VI_SNAP_DROP_STATES")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
     let n_pad = f.cp.len();
     // SAFETY: AtomicU64 は u64 と同一表現。scope 終了まで f.cp 本体には触れない。
     let cp_atomic: &[AtomicU64] =
@@ -148,6 +180,16 @@ pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u
 
     let mut cand_list: Vec<(u32, u32)> =
         seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
+
+    // 低メモリ動画モードの states 解放はここ (種付け後)。seed_frontier_2d は vi.states を
+    // 走査して初期フロンティア (goal セル) を作るので、その前に解放すると種が空になり
+    // updates=0 の縮退収束になる。種は cand_list に確保済みで、以降スイープ本体も
+    // Snapshotter も states を参照しない (snapshot は cp/pen から直接ダンプ)。
+    if drop_states {
+        vi.states = Vec::new();
+        vi.states.shrink_to_fit();
+    }
+
     let mut changed_lists: Vec<Vec<(u32, u32, u64)>> = vec![Vec::new(); nthreads];
 
     let shared = Shared {
@@ -163,6 +205,10 @@ pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u
     let g_ref = &g;
     let mask_ref: &[AtomicU64] = &mask_arr;
 
+    // スナップショット計時はここから (Geom/Fused::build_direct・seed_frontier_2d を除外した
+    // 純スイープ時間)。巨大マップでは build_direct が支配的になり得るが、本家 ROS1 の
+    // snapshotWorker もセットアップを除外して計測する (README「vi_rs と同条件」) ので合わせる。
+    let t_solve0 = Instant::now();
     let total_updates: u64 = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..nthreads)
             .map(|w| {
@@ -355,8 +401,12 @@ pub fn frontier2d_sparse_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u
     let converged = converged_out.load(Ordering::Relaxed);
 
     // 方策は cp から最終 argmin (fused と共有)、書き戻しは行バンド並列。
-    let opt = final_policy_fused(&g, &f, nthreads, converged);
-    write_back_fused(vi, &g, &f, &opt);
+    // 低メモリモードでは states を解放済みなので、書き戻し / policy 算出をスキップする
+    // (どちらも states 規模の確保を伴うため、メモリ削減の意味も兼ねる)。
+    if !drop_states {
+        let opt = final_policy_fused(&g, &f, nthreads, converged);
+        write_back_fused(vi, &g, &f, &opt);
+    }
 
     (iters, total_updates, converged)
 }

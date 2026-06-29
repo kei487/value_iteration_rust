@@ -58,7 +58,11 @@ use clap::Parser;
 use vi_bench::fixtures::canonical_actions;
 use vi_bench::pgm::{self, Occupancy, PgmMap};
 use vi_reference::params::{MAX_COST, PROB_BASE};
-use vi_reference::solvers::{solve, U64Solver};
+use memmap2::MmapMut;
+use vi_reference::solvers::frontier2d_sparse_compact::{
+    default_threads, mapped_goal_cell_count, solve_compact_mapped, CompactSink, RamSink,
+};
+use vi_reference::solvers::{solve, U64SolveStats, U64Solver};
 use vi_reference::{OccupancyGrid, Quaternion, State, ValueIterator};
 
 /// Canonical theta cell count (本家 launch / data contract).
@@ -127,6 +131,16 @@ struct Args {
     #[arg(long, default_value_t = 2_000_000)]
     max_iters: u32,
 
+    /// 値バンド幅（`frontier2d_sparse_compact` 専用、18bit 固定小数点単位）。0=auto（結合深さの
+    /// 安全側）。小さいほど常駐メモリは減るが、結合深さ未満だと bit-exact が壊れる。
+    #[arg(long, default_value_t = 0)]
+    compact_band: u64,
+
+    /// compact の確定出力をディスク mmap に置くディレクトリ（value/policy を RAM から外す）。
+    /// 未指定なら RAM 出力。巨大マップで出力の O(total) RAM を避けたいとき指定する。
+    #[arg(long)]
+    compact_out_dir: Option<PathBuf>,
+
     /// Optional CSV output path (parent dirs created).
     #[arg(long)]
     out: Option<PathBuf>,
@@ -172,6 +186,10 @@ enum SolverSel {
     /// fused + θマスク疎評価 (依存 θ のみ再評価)。収束値は bit-exact のまま。
     #[value(name = "frontier2d_sparse")]
     Frontier2dSparse,
+    /// アウトオブコア版（値バンド+遅延確保+退避）。メモリ制約下で巨大マップを bit-exact に解く。
+    /// `--compact-band` で値バンド幅（0=auto）。
+    #[value(name = "frontier2d_sparse_compact")]
+    Frontier2dSparseCompact,
     Both,
 }
 
@@ -182,6 +200,58 @@ struct Row {
     updates: u64,
     total_ms: f64,
     converged: bool,
+}
+
+/// `frontier2d_sparse_compact` の確定出力をディスク mmap に置く `CompactSink` 実装。value (u64 LE)
+/// と policy (i32 LE) を 2 ファイルに分け、列連続で write、orig 単位で read する。これで出力の
+/// O(total) RAM をディスクへ外せる（巨大マップ対応）。未書き込み = 到達不能 → (MAX_COST, -1)。
+struct MmapSink {
+    value: MmapMut,  // nstates * 8 bytes
+    action: MmapMut, // nstates * 4 bytes
+}
+
+impl MmapSink {
+    fn new(dir: &std::path::Path, nstates: usize) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let map = |name: &str, bytes: usize| -> std::io::Result<MmapMut> {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dir.join(name))?;
+            f.set_len(bytes as u64)?;
+            unsafe { MmapMut::map_mut(&f) }
+        };
+        let mut value = map("compact_value.bin", nstates * 8)?;
+        let mut action = map("compact_action.bin", nstates * 4)?;
+        // 初期化: 未書き込み（到達不能）セルが (MAX_COST, None) と読めるように。
+        let le = MAX_COST.to_le_bytes();
+        for rec in value.chunks_exact_mut(8) {
+            rec.copy_from_slice(&le);
+        }
+        action.fill(0xFF); // i32 -1 = 全バイト 0xFF。
+        Ok(Self { value, action })
+    }
+}
+
+impl CompactSink for MmapSink {
+    fn write_column(&mut self, base: usize, values: &[u64], actions: &[i32]) {
+        let vb = &mut self.value[base * 8..(base + values.len()) * 8];
+        for (i, &v) in values.iter().enumerate() {
+            vb[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        let ab = &mut self.action[base * 4..(base + actions.len()) * 4];
+        for (i, &a) in actions.iter().enumerate() {
+            ab[i * 4..i * 4 + 4].copy_from_slice(&a.to_le_bytes());
+        }
+    }
+
+    fn read(&self, orig: usize) -> (u64, i32) {
+        let v = u64::from_le_bytes(self.value[orig * 8..orig * 8 + 8].try_into().unwrap());
+        let a = i32::from_le_bytes(self.action[orig * 4..orig * 4 + 4].try_into().unwrap());
+        (v, a)
+    }
 }
 
 fn default_map_path() -> PathBuf {
@@ -203,7 +273,8 @@ fn occupancy_fractions(map: &PgmMap) -> (f64, f64, f64) {
 }
 
 /// Build a downsampled occupancy grid (row-major, `data[x + ow*y]`, y=0 at world
-/// origin). Vertical flip matches `pgm::build_penalty` / `make_goal_mask`.
+/// origin). The vertical flip puts grid row `iy = 0` at world `y = origin_y`
+/// (ROS stores occupancy bottom-up; PGM rows run top-down).
 /// Each output cell is `100` (blocked) if ANY source cell in its `scale×scale`
 /// block is an obstacle (conservative pooling), else `0` (free).
 fn build_occupancy(map: &PgmMap, scale: usize, unknown_as_obstacle: bool) -> (Vec<i8>, i32, i32) {
@@ -375,9 +446,28 @@ fn main() -> ExitCode {
     };
 
     // Goal-mask sanity: count goal (cost-0) cells so an empty goal is visible.
-    let goal_cells = {
-        let vi = build();
-        vi.states.iter().filter(|s| s.total_cost < REACH).count()
+    // Build the ValueIterator once here and reuse it for the first solver's solve
+    // (subsequent solvers rebuild fresh in the loop). At 627M states a `set_map`
+    // build costs tens of seconds single-threaded, so this throwaway is worth avoiding.
+    // compact-only モードは states（O(total)）を一切確保しない（mapped 経路）。prebuilt はスキップし、
+    // goal_cells は MapSource から数える（O(nx·ny)）。
+    let compact_only = matches!(args.solver, SolverSel::Frontier2dSparseCompact);
+    let mut prebuilt: Option<ValueIterator> = if compact_only { None } else { Some(build()) };
+    let goal_cells = if let Some(p) = prebuilt.as_ref() {
+        p.states.iter().filter(|s| s.total_cost < REACH).count()
+    } else {
+        mapped_goal_cell_count(
+            canonical_actions(),
+            &grid,
+            THETA_CELL_NUM,
+            args.safety_radius_m,
+            args.safety_penalty,
+            goal_radius_m,
+            args.goal_margin_theta_deg,
+            goal_wx,
+            goal_wy,
+            goal_t,
+        )
     };
 
     // --- Banner ---
@@ -403,7 +493,22 @@ fn main() -> ExitCode {
         free_states,
     );
     let states_gb = states as f64 * std::mem::size_of::<State>() as f64 / 1e9;
-    eprintln!("est. memory: states {:.2} GB ({} B/state)", states_gb, std::mem::size_of::<State>());
+    if compact_only {
+        // mapped 経路は states を作らず、2D の free(1B)+pen2d(8B)/cell だけ常駐（O(nx·ny)）。
+        let src_mb = (ow as f64) * (oh as f64) * 9.0 / 1e6;
+        eprintln!(
+            "est. memory: mapped 2D source {:.1} MB (free+pen, {} B/state states {:.2} GB は非確保)",
+            src_mb,
+            std::mem::size_of::<State>(),
+            states_gb,
+        );
+    } else {
+        eprintln!(
+            "est. memory: states {:.2} GB ({} B/state)",
+            states_gb,
+            std::mem::size_of::<State>()
+        );
+    }
     if req_gx != gx || req_gy != gy {
         eprintln!("goal snapped to nearest free cell");
     }
@@ -457,6 +562,13 @@ fn main() -> ExitCode {
     if matches!(args.solver, SolverSel::Frontier2dSparse) {
         schedule.push(("frontier2d_sparse", U64Solver::Frontier2DSparse, args.max_iters));
     }
+    if matches!(args.solver, SolverSel::Frontier2dSparseCompact) {
+        schedule.push((
+            "frontier2d_sparse_compact",
+            U64Solver::Frontier2DSparseCompact { band: args.compact_band },
+            args.max_iters,
+        ));
+    }
 
     if want_ref && states > 100_000_000 {
         eprintln!(
@@ -470,9 +582,72 @@ fn main() -> ExitCode {
     let mut rows: Vec<Row> = Vec::new();
     for (sel, solver, budget) in schedule {
         eprintln!("running {sel} ...");
-        let mut vi = build();
         let t0 = Instant::now();
-        let stats = solve(&mut vi, solver, budget);
+        // 解いた結果の参照元: 非 compact は vi.states、compact(mapped) は sink（states なし）。
+        // dump はどちらからでも `value_at` 経由で読む。
+        let mut solved_vi: Option<ValueIterator> = None;
+        let mut compact_sink: Option<Box<dyn CompactSink>> = None;
+        // compact は CompactStats を直接取ってメモリ指標も出す（汎用 solve は値を捨てるため）。
+        let stats = match solver {
+            U64Solver::Frontier2DSparseCompact { band } => {
+                let bo = if band == 0 { None } else { Some(band) };
+                let nstates = states as usize; // ow·oh·nt（vi.states を作らない）。
+                let nthreads = default_threads();
+                // mapped 経路: states（O(total)）を確保せず、マップ + ゴールから直接解く。出力は
+                // sink（--compact-out-dir でディスク mmap、なければ RAM）に確定。
+                let run = |sink: &mut dyn CompactSink| {
+                    solve_compact_mapped(
+                        canonical_actions(),
+                        1,
+                        &grid,
+                        THETA_CELL_NUM,
+                        args.safety_radius_m,
+                        args.safety_penalty,
+                        goal_radius_m,
+                        args.goal_margin_theta_deg,
+                        goal_wx,
+                        goal_wy,
+                        goal_t,
+                        budget,
+                        bo,
+                        sink,
+                        nthreads,
+                    )
+                };
+                let (s, sink): (_, Box<dyn CompactSink>) = if let Some(dir) = &args.compact_out_dir {
+                    eprintln!(
+                        "  output: disk mmap at {} ({} states, ~{:.2} GB on disk)",
+                        dir.display(),
+                        nstates,
+                        nstates as f64 * 12.0 / 1e9,
+                    );
+                    let mut sink = MmapSink::new(dir, nstates).expect("create mmap output sink");
+                    let st = run(&mut sink);
+                    (st, Box::new(sink))
+                } else {
+                    let mut sink = RamSink::new(nstates);
+                    let st = run(&mut sink);
+                    (st, Box::new(sink))
+                };
+                eprintln!(
+                    "  memory: resident_blocks_peak={}/{}  freed_blocks={}  resident_cols_peak={}/{}",
+                    s.peak_resident_blocks,
+                    s.total_blocks,
+                    s.freed_blocks,
+                    s.peak_resident_cols,
+                    s.reachable_cols,
+                );
+                compact_sink = Some(sink);
+                U64SolveStats { iters: s.iters, updates: s.updates, converged: s.converged }
+            }
+            _ => {
+                // Reuse the prebuilt ValueIterator for the first solver; rebuild for the rest.
+                let mut vi = prebuilt.take().unwrap_or_else(|| build());
+                let st = solve(&mut vi, solver, budget);
+                solved_vi = Some(vi);
+                st
+            }
+        };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let row = Row {
             solver: sel,
@@ -489,6 +664,21 @@ fn main() -> ExitCode {
             row.total_ms,
             if row.converged { "Y" } else { "N" },
         );
+        // 結果値の参照: 非 compact は vi.states、compact(mapped) は sink（orig 索引は同一順序）。
+        let value_at = |ix: i32, iy: i32, it: i32| -> u64 {
+            // usize 演算（i32 だと iy*THETA*ow が巨大マップで i32 オーバーフロー）。
+            let orig = it as usize
+                + ix as usize * THETA_CELL_NUM as usize
+                + iy as usize * THETA_CELL_NUM as usize * ow as usize;
+            if let Some(vi) = &solved_vi {
+                vi.states[orig].total_cost
+            } else if let Some(sink) = &compact_sink {
+                sink.read(orig).0
+            } else {
+                u64::MAX
+            }
+        };
+
         // Optional value-field dump (min over theta, seconds) for overlay viz.
         if let Some(path) = &args.dump_value {
             use std::io::Write;
@@ -497,8 +687,7 @@ fn main() -> ExitCode {
                 for ix in 0..ow {
                     let mut best = u64::MAX;
                     for it in 0..THETA_CELL_NUM {
-                        let idx = vi.to_index(ix, iy, it) as usize;
-                        let c = vi.states[idx].total_cost;
+                        let c = value_at(ix, iy, it);
                         if c < best {
                             best = c;
                         }
@@ -523,7 +712,9 @@ fn main() -> ExitCode {
         }
 
         // Optional optimal-trajectory dump (follow policy from start to goal).
+        // 方策追従は full な vi.states/actions/action_cost が要るので非 compact 経路のみ対応。
         if let Some(path_out) = &args.dump_path {
+          if let Some(vi) = &solved_vi {
             use std::io::Write;
             let (ox, oy) = (grid.origin_x, grid.origin_y);
             let t_res = 360.0 / THETA_CELL_NUM as f64;
@@ -613,6 +804,11 @@ fn main() -> ExitCode {
                 }
                 Err(e) => eprintln!("error: failed to write path dump {}: {e}", path_out.display()),
             }
+          } else {
+            eprintln!(
+                "note: --dump-path は mapped(compact) 経路では未対応（--compact-out-dir の disk 出力を別ツールで追跡してください）"
+            );
+          }
         }
 
         rows.push(row);

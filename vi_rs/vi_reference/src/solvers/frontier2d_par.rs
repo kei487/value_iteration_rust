@@ -118,59 +118,21 @@ pub fn frontier2d_par_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64,
 /// 収束した `hot` から全 free・非 final セルの optimal_action を計算 (並列・読み取り専用)。
 /// 返り値はオリジナル座標 index の `Vec<Option<usize>>`。
 /// `frontier2d_par_unsafe` も収束後にこの最終 argmin パスを共有する。
+/// 並列骨格は [`super::final_policy_parallel`] が担い、ここでは Padded 固有の
+/// 評価ガードとコスト関数 (`action_cost_pad`) だけを与える。
 pub(crate) fn final_policy(m: &Padded, nthreads: usize) -> Vec<Option<usize>> {
-    let (nx, ny, nt) = (m.nx, m.ny, m.nt);
-    let n = (nx * ny * nt) as usize;
-    let rows: Vec<i32> = (0..ny).collect();
-    let chunk = rows.len().div_ceil(nthreads).max(1);
-
-    let parts: Vec<Vec<(usize, Option<usize>)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = rows
-            .chunks(chunk)
-            .map(|band| {
-                scope.spawn(move || {
-                    let mut out: Vec<(usize, Option<usize>)> = Vec::new();
-                    for &iy in band {
-                        for ix in 0..nx {
-                            let pad_col = m.pad_col(ix, iy);
-                            let orig_col = (ix * nt + iy * (nt * nx)) as usize;
-                            for it in 0..nt {
-                                let pad_idx = (pad_col + it as i64) as usize;
-                                if !m.free[pad_idx] || m.finals[pad_idx] {
-                                    continue;
-                                }
-                                let mut min_cost = MAX_COST;
-                                let mut min_action: Option<usize> = None;
-                                for (ai, per_theta) in m.precomp.iter().enumerate() {
-                                    let c = action_cost_pad(
-                                        m.hot.as_slice(),
-                                        &m.free,
-                                        &per_theta[it as usize],
-                                        pad_col,
-                                    );
-                                    if c < min_cost {
-                                        min_cost = c;
-                                        min_action = Some(ai);
-                                    }
-                                }
-                                out.push((orig_col + it as usize, min_action));
-                            }
-                        }
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    let mut opt = vec![None; n];
-    for part in parts {
-        for (orig, action) in part {
-            opt[orig] = action;
-        }
-    }
-    opt
+    super::final_policy_parallel(
+        m.nx,
+        m.ny,
+        m.nt,
+        m.mx,
+        m.my,
+        m.row_stride,
+        &m.precomp,
+        nthreads,
+        |pad_idx| !m.free[pad_idx] || m.finals[pad_idx],
+        |buckets, pad_col| action_cost_pad(m.hot.as_slice(), &m.free, buckets, pad_col),
+    )
 }
 
 #[cfg(test)]

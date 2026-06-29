@@ -4,7 +4,7 @@
 //! （`action_cost_raw`）に委譲するので、k が全 outcome 数以上なら Frontier3D と bit-exact。
 
 use crate::params::MAX_COST;
-use crate::solvers::{displacement, seed_frontier, Bitboard3D};
+use crate::solvers::frontier3d_driver;
 use crate::value_iterator::{action_cost_raw, to_index_raw, ValueIterator};
 use crate::{Action, State};
 
@@ -60,46 +60,31 @@ fn action_cost_topk(
 
 /// セット済み `ValueIterator` を Frontier3DTopK で収束まで解く。`(iters, updates, converged)`。
 pub fn frontier3d_topk_solve(vi: &mut ValueIterator, k: u32, max_iter: u32) -> (u32, u64, bool) {
-    let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
-    let (mx, my, mt) = displacement(vi);
-    let (dx, dy, dt) = (mx as u32, my as u32, mt as u32);
-    let mut frontier = seed_frontier(vi);
-    let mut updates: u64 = 0;
-    let mut iters: u32 = 0;
-    while frontier.popcount() > 0 && iters < max_iter {
-        iters += 1;
-        let candidates = frontier.dilate(dx, dy, dt);
-        let mut new_frontier = Bitboard3D::new(nx as u32, ny as u32, nt as u32);
-        for (ix, iy, it) in candidates.enumerate() {
-            let idx = vi.to_index(ix as i32, iy as i32, it as i32) as usize;
-            if !vi.states[idx].free || vi.states[idx].final_state {
-                continue;
-            }
-            let old = vi.states[idx].total_cost;
-            // min over アクションの top-k コスト（書き込まず計算）。
-            let (mut min_cost, mut min_a) = (MAX_COST, None);
-            {
-                let s = &vi.states[idx];
-                for (ai, a) in vi.actions.iter().enumerate() {
-                    let c = action_cost_topk(&vi.states, a, s, k, nx, ny, nt);
-                    if c < min_cost {
-                        min_cost = c;
-                        min_a = Some(ai);
-                    }
+    frontier3d_driver(vi, max_iter, |vi, ix, iy, it| {
+        let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+        let idx = vi.to_index(ix as i32, iy as i32, it as i32) as usize;
+        if !vi.states[idx].free || vi.states[idx].final_state {
+            return false;
+        }
+        let old = vi.states[idx].total_cost;
+        // min over アクションの top-k コスト（書き込まず計算）。
+        let (mut min_cost, mut min_a) = (MAX_COST, None);
+        {
+            let s = &vi.states[idx];
+            for (ai, a) in vi.actions.iter().enumerate() {
+                let c = action_cost_topk(&vi.states, a, s, k, nx, ny, nt);
+                if c < min_cost {
+                    min_cost = c;
+                    min_a = Some(ai);
                 }
             }
-            // value_iteration_raw と同じく **無条件**に total_cost/optimal_action を書く
-            // （k=全 outcome のとき policy まで bit-exact になる）。フロンティア追加は減少時のみ。
-            vi.states[idx].total_cost = min_cost;
-            vi.states[idx].optimal_action = min_a;
-            if min_cost < old {
-                updates += 1;
-                new_frontier.set(ix, iy, it);
-            }
         }
-        frontier = new_frontier;
-    }
-    (iters, updates, frontier.popcount() == 0)
+        // value_iteration_raw と同じく **無条件**に total_cost/optimal_action を書く
+        // （k=全 outcome のとき policy まで bit-exact になる）。フロンティア追加は減少時のみ。
+        vi.states[idx].total_cost = min_cost;
+        vi.states[idx].optimal_action = min_a;
+        min_cost < old
+    })
 }
 
 #[cfg(test)]
