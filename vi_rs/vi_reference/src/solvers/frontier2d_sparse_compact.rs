@@ -449,14 +449,21 @@ pub fn solve_compact_into(
     let band = band_override.unwrap_or_else(|| couple_margin(&g, store.max_pen));
 
     // 列ごとの現在値域と final フラグ。初期値域は states スキャンで（ブロックを構築せず）作る。
+    // `live` = 到達済み（`col_min != MAX`）かつ非 final の列インデックス集合。波ごとの
+    // finalize/再活性/終了判定/常駐ピークは全列 O(ncol) 走査ではなく `live` の反復で行う
+    // （バンド ≪ 全グリッドなので走査が O(band) になる）。`reached` で二重 push を防ぐ。
     let mut col_min = vec![MAX_COST; ncol];
     let mut col_max = vec![MAX_COST; ncol];
     let mut col_final = vec![false; ncol];
+    let mut reached = vec![false; ncol];
+    let mut live: Vec<usize> = Vec::new();
     for s in states {
         if s.free && s.total_cost < MAX_COST {
             let i = cidx(s.ix, s.iy);
             let v = s.total_cost; // value = cp − pen = total_cost
-            if col_min[i] == MAX_COST {
+            if !reached[i] {
+                reached[i] = true;
+                live.push(i);
                 col_min[i] = v;
                 col_max[i] = v;
             } else {
@@ -481,6 +488,10 @@ pub fn solve_compact_into(
                 let (chg, mn, mx, ups) = relax_column(&mut store, &g, ix, iy, states);
                 col_min[i] = mn;
                 col_max[i] = mx;
+                if mn != MAX_COST && !reached[i] {
+                    reached[i] = true;
+                    live.push(i); // 新規到達列を live へ。
+                }
                 total_updates += ups;
                 if chg {
                     any = true;
@@ -503,64 +514,67 @@ pub fn solve_compact_into(
                 .collect();
         }
 
-        // ── ウォーターマーク finalize: col_max ≤ T − band ──
+        // ── ウォーターマーク finalize: col_max ≤ T − band。live のみ走査。 ──
+        // finalize した列が属する行ブロック（列 (ix,iy) → ブロック (iy+my)/BLOCK_ROWS）を
+        // 記録し、退避はその近傍ブロックだけ調べる（O(nblocks) 全走査を回避）。
         let wm = t.saturating_sub(band);
-        for iy in 0..ny {
-            for ix in 0..nx {
-                let i = cidx(ix, iy);
-                if !col_final[i] && col_max[i] != MAX_COST && col_max[i] <= wm {
-                    finalized += finalize_column(&mut store, &g, ix, iy, states, sink);
-                    col_final[i] = true;
-                }
+        let mut touched_blocks: Vec<usize> = Vec::new();
+        for &i in &live {
+            if col_max[i] <= wm {
+                let ix = (i % nx as usize) as i32;
+                let iy = (i / nx as usize) as i32;
+                finalized += finalize_column(&mut store, &g, ix, iy, states, sink);
+                col_final[i] = true;
+                touched_blocks.push((iy + store.my) as usize / BLOCK_ROWS);
             }
         }
+        live.retain(|&i| !col_final[i]);
 
-        // ── 退避: interior-final（自 ± halo ブロックが全 final）のブロックを解放 ──
-        let nb = store.nblocks();
-        for b in 0..nb {
-            if store.evicted[b] {
-                continue;
+        // ── 退避: finalize 列の近傍ブロック（±halo）のうち interior-final のものを解放。 ──
+        // ブロック b が新たに退避可能になるのは b±halo の最後の非 full ブロックが full 化した瞬間 =
+        // b±halo 内の列が finalize した波。その列の b_col は b±halo に入る ⟺ b は b_col±halo に入る
+        // ので、touched_blocks±halo を候補にすれば取りこぼさない（健全性は元の全走査と同一）。
+        if !touched_blocks.is_empty() {
+            let nb = store.nblocks();
+            touched_blocks.sort_unstable();
+            touched_blocks.dedup();
+            let mut cand: Vec<usize> = Vec::new();
+            for &b in &touched_blocks {
+                let lo = b.saturating_sub(halo_blocks);
+                let hi = (b + halo_blocks).min(nb - 1);
+                cand.extend(lo..=hi);
             }
-            let lo = b.saturating_sub(halo_blocks);
-            let hi = (b + halo_blocks).min(nb - 1);
-            if (lo..=hi).all(|k| store.block_full(k)) {
-                // 確保済みなら解放（未確保＝touch されていないブロックは退避不要）。
-                if store.blocks[b].is_some() {
+            cand.sort_unstable();
+            cand.dedup();
+            for b in cand {
+                if store.evicted[b] || store.blocks[b].is_none() {
+                    continue; // 退避済み or 未確保（空/パディング）は対象外。
+                }
+                let lo = b.saturating_sub(halo_blocks);
+                let hi = (b + halo_blocks).min(nb - 1);
+                if (lo..=hi).all(|k| store.block_full(k)) {
                     store.evict_block(b);
                     freed_blocks += 1;
-                } else {
-                    store.evicted[b] = true; // touch されず全 final（=パディング/空）→ 退避済み扱い。
                 }
             }
         }
 
         peak_resident_blocks = peak_resident_blocks.max(store.resident_blocks() as u64);
-        let resident_cols = (0..ncol)
-            .filter(|&i| !col_final[i] && col_min[i] != MAX_COST)
-            .count() as u64;
-        peak_resident_cols = peak_resident_cols.max(resident_cols);
+        peak_resident_cols = peak_resident_cols.max(live.len() as u64);
 
-        // ── 終了判定: 到達済み非 final 列が残っていない ──
-        let mut remaining = false;
-        for i in 0..ncol {
-            if !col_final[i] && col_min[i] != MAX_COST {
-                remaining = true;
-                break;
-            }
-        }
-        if !remaining {
+        // ── 終了判定: 到達済み非 final 列（= live）が残っていない ──
+        if live.is_empty() {
             break true;
         }
 
-        // T を次バンドへ進め、deferred（到達済み・非 final・col_min < 新 T）を膨張して再活性。
+        // T を次バンドへ進め、deferred（live かつ col_min < 新 T）を膨張して再活性。
         t = t.saturating_add(band);
         let mut react = Bitboard2D::new(nx as u32, ny as u32);
-        for iy in 0..ny {
-            for ix in 0..nx {
-                let i = cidx(ix, iy);
-                if !col_final[i] && col_min[i] != MAX_COST && col_min[i] < t {
-                    react.set(ix as u32, iy as u32);
-                }
+        for &i in &live {
+            if col_min[i] < t {
+                let ix = (i % nx as usize) as u32;
+                let iy = (i / nx as usize) as u32;
+                react.set(ix, iy);
             }
         }
         frontier = react
