@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""bench_map の `frontier2d_sparse_compact` ディスク出力を value/policy 図にする。
+"""bench_map の `frontier2d_sparse_compact` ディスク出力を value 図にする。
 
-`bench_map --solver frontier2d_sparse_compact --compact-out-dir <dir> [--dump-value <dir>/value_field.f32]`
-が出す以下を読む（索引は本家 toIndex と同じ `orig = it + ix*nt + iy*nt*nx`）:
+既存の VI value オーバーレイ図（`vi_compare/benches/tsudanuma/plot.py` の
+`fig_map_overlay`）と同じフォーマットで描く:
+  - 背景 = グレー占有マップ（free=0.92 / obstacle=0.18）
+  - value = turbo 線形（vmin=0, vmax=到達セルの P90）を alpha 0.92 で重畳
+  - ゴール ★(lime) ・ロボット始点 ●(magenta) ・最適経路（白線）
 
-  value_field.f32    : --dump-value の出力。header i32(ow), i32(oh) + ow*oh の f32
-                       (θ最小の value[秒], 到達不能=NaN)。value 図はこれだけで描ける。
-  compact_value.bin  : nstates × u64 LE。値は PROB_BASE 単位 (262144 = 1 秒)、
-                       1e9*PROB_BASE = 到達不能。
-  compact_action.bin : nstates × i32 LE。-1 = None(ゴール/到達不能)、0..5 = action 索引
-                       (0 forward / 1 back / 2 right / 3 rightfw / 4 left / 5 leftfw)。
+入力（`bench_map --solver frontier2d_sparse_compact --compact-out-dir <dir>
+--dump-value <dir>/value_field.f32` が出すもの）:
 
-policy パネル(右)は生 bin が要る。無ければ value パネルのみ描く。grid 次元 ow×oh は
-value_field.f32 のヘッダから取り、θ数 nt は --nt(既定 60)。
+  value_field.f32  : header i32(ow), i32(oh) + ow*oh の f32（θ最小の value[秒]、
+                     到達不能=NaN、索引 v[ix + ow*iy] = world bottom-up）。
+
+占有マップ背景は元の PGM を value グリッド解像度（`--scale` で down-sample）へ
+bench_map と同じ規則（保守プーリング＋上下反転）でプールして描く。`--map` 省略時は
+壁を描けないため一様グレー背景にフォールバックする。
 
 使い方:
-  python3 render_compact.py <out_dir> [--nt 60] [--out <out_dir>/compact_viz.png] [--no-policy]
+  # tsudanuma を scale 5 で解いた compact 出力を、元マップ重畳で描く
+  python3 render_compact.py <out_dir> --map assets/map_tsudanuma.yaml --scale 5
+
+  # 始点を与えると最適経路（V 降下）と始点マーカも描く
+  python3 render_compact.py <out_dir> --map ... --scale 5 --start-x 35.2 --start-y 162.8
 """
 import argparse
 import os
@@ -26,82 +33,248 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, LogNorm
-
-PROB_BASE = 262144  # 18bit 固定小数 = 1 秒
-ACTION_NAMES = ["forward", "back", "right", "rightfw", "left", "leftfw"]
 
 
+# ---------- inputs ----------
 def load_value_field(path):
-    """value_field.f32 (header i32 ow, i32 oh + ow*oh f32) を (oh, ow) で返す。"""
+    """value_field.f32 (header i32 ow, i32 oh + ow*oh f32) を (oh, ow) bottom-up で返す。"""
     with open(path, "rb") as fh:
         ow, oh = (int(v) for v in np.fromfile(fh, dtype="<i4", count=2))
         vf = np.fromfile(fh, dtype="<f4", count=ow * oh).reshape(oh, ow)
     return vf, ow, oh
 
 
-def best_theta_policy(out_dir, ow, oh, nt):
-    """compact_value/action.bin から各セルの最良 θ の action (-1..5) を (oh, ow) で返す。"""
-    val = np.fromfile(f"{out_dir}/compact_value.bin", dtype="<u8").reshape(oh, ow, nt)
-    act = np.fromfile(f"{out_dir}/compact_action.bin", dtype="<i4").reshape(oh, ow, nt)
-    best = val.argmin(axis=2)
-    iy, ix = np.indices((oh, ow))
-    return act[iy, ix, best]
+def parse_yaml(path):
+    """map YAML の必要フィールドだけ拾う簡易パーサ。"""
+    cfg = {"resolution": 0.05, "origin": [0.0, 0.0, 0.0],
+           "occupied_thresh": 0.65, "free_thresh": 0.196, "negate": 0, "image": None}
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            k, v = (s.strip() for s in line.split(":", 1))
+            if k == "image":
+                cfg["image"] = v
+            elif k == "origin":
+                cfg["origin"] = [float(x) for x in v.strip("[]").split(",")]
+            elif k in ("resolution", "occupied_thresh", "free_thresh"):
+                cfg[k] = float(v)
+            elif k == "negate":
+                cfg["negate"] = int(v)
+    return cfg
+
+
+def load_pgm(path):
+    """P5 PGM を (h, w) uint8 (top-down) で返す。"""
+    with open(path, "rb") as f:
+        assert f.readline().strip() == b"P5", "not a binary PGM (P5)"
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        w, h = map(int, line.split())
+        int(f.readline())
+        data = np.frombuffer(f.read(w * h), dtype=np.uint8).reshape(h, w)
+    return data
+
+
+def build_occupancy(pixels, scale, cfg, unknown_as_obstacle):
+    """PGM(top-down) を value グリッド解像度 (oh, ow) bottom-up の occupied(bool) にプール。
+
+    bench_map::build_occupancy と同じ:
+      occ_prob = (negate? p : 255-p)/255、obstacle: occ>=occupied_thresh、
+      free: occ<free_thresh、それ以外は unknown。出力セルはブロック内に obstacle
+      (unknown_as_obstacle なら unknown も) が 1 つでもあれば blocked（保守プーリング）。
+      上下反転で出力 row iy=0 を world y=origin_y に合わせる。
+    """
+    h, w = pixels.shape
+    p = pixels.astype(np.float64)
+    occ_prob = (p / 255.0) if cfg["negate"] else ((255.0 - p) / 255.0)
+    obstacle = occ_prob >= cfg["occupied_thresh"]
+    if unknown_as_obstacle:
+        unknown = (occ_prob >= cfg["free_thresh"]) & (occ_prob < cfg["occupied_thresh"])
+        obstacle = obstacle | unknown
+    obstacle = obstacle[::-1, :]  # top-down -> bottom-up (world y up)
+    ow = -(-w // scale)  # ceil
+    oh = -(-h // scale)
+    padded = np.zeros((oh * scale, ow * scale), dtype=bool)
+    padded[:h, :w] = obstacle
+    return padded.reshape(oh, scale, ow, scale).any(axis=(1, 3)), ow, oh
+
+
+# ---------- optimal path via V descent (plot.py と同じ手法) ----------
+def _clear_los(v_img, r0, c0, r1, c1):
+    n = int(max(abs(r1 - r0), abs(c1 - c0))) + 1
+    rs = np.round(np.linspace(r0, r1, n)).astype(int)
+    cs = np.round(np.linspace(c0, c1, n)).astype(int)
+    return bool(np.all(np.isfinite(v_img[rs, cs])))
+
+
+def descend_path(v_img, sr, sc, gr, gc, max_steps=100000):
+    """V のコスト到達場を降下してゴールまで経路を辿る（壁を横切らない line-of-sight）。"""
+    h, w = v_img.shape
+    path = [(sr, sc)]
+    r, c = sr, sc
+    visited = {(r, c)}
+    for _ in range(max_steps):
+        if abs(r - gr) <= 2 and abs(c - gc) <= 2:
+            path.append((gr, gc))
+            break
+        cur = v_img[r, c]
+        nr, nc = r, c
+        for R in (2, 3, 4, 6, 8):
+            r0, r1 = max(0, r - R), min(h, r + R + 1)
+            c0, c1 = max(0, c - R), min(w, c + R + 1)
+            sub = v_img[r0:r1, c0:c1]
+            mask = np.isfinite(sub) & (sub < cur)
+            if not mask.any():
+                continue
+            order = np.argsort(np.where(mask, sub, np.inf), axis=None)
+            for k in order:
+                yy, xx = np.unravel_index(k, sub.shape)
+                if not mask[yy, xx]:
+                    break
+                cand = (r0 + yy, c0 + xx)
+                if cand in visited:
+                    continue
+                if _clear_los(v_img, r, c, cand[0], cand[1]):
+                    nr, nc = cand
+                    break
+            if (nr, nc) != (r, c):
+                break
+        if (nr, nc) == (r, c):
+            break  # truly stuck
+        r, c = nr, nc
+        visited.add((r, c))
+        path.append((r, c))
+    return np.array(path)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out_dir", help="bench_map --compact-out-dir に渡したディレクトリ")
-    ap.add_argument("--nt", type=int, default=60, help="θ セル数 (既定 60)")
-    ap.add_argument("--out", default=None, help="出力 PNG (既定 <out_dir>/compact_viz.png)")
-    ap.add_argument("--no-policy", action="store_true", help="value パネルのみ (bin を読まない)")
-    ap.add_argument("--title", default=None, help="図タイトル")
+    ap.add_argument("--map", default=None, help="占有マップ背景用の YAML か PGM（推奨: 解いた時の YAML）")
+    ap.add_argument("--scale", type=int, default=1, help="bench_map に渡した down-sample 係数（既定 1）")
+    ap.add_argument("--unknown", choices=("obstacle", "free"), default="obstacle",
+                    help="map_server の unknown(灰)セルの扱い（既定 obstacle、bench_map と合わせる）")
+    ap.add_argument("--nt", type=int, default=60, help="θ セル数（タイトルの状態数表示用、既定 60）")
+    ap.add_argument("--vmax-pct", type=float, default=90.0, help="value カラースケール上限の百分位（既定 90）")
+    ap.add_argument("--goal-x", type=float, default=None, help="ゴール world X[m]（既定: V 最小セル）")
+    ap.add_argument("--goal-y", type=float, default=None, help="ゴール world Y[m]（既定: V 最小セル）")
+    ap.add_argument("--start-x", type=float, default=None, help="始点 world X[m]（与えると経路と始点を描く）")
+    ap.add_argument("--start-y", type=float, default=None, help="始点 world Y[m]")
+    ap.add_argument("--out", default=None, help="出力 PNG（既定 <out_dir>/compact_viz.png）")
+    ap.add_argument("--title", default=None, help="図タイトル上書き")
     args = ap.parse_args()
 
     vf_path = f"{args.out_dir}/value_field.f32"
     if not os.path.exists(vf_path):
         sys.exit(f"error: {vf_path} がありません。bench_map に --dump-value {vf_path} を付けて実行してください。")
-    vf, ow, oh = load_value_field(vf_path)
-    reach = np.isfinite(vf)
-    print(f"grid {ow}x{oh}x{args.nt}  reachable cells {int(reach.sum())}  Vmax={np.nanmax(vf):.1f}s")
+    vf, ow, oh = load_value_field(vf_path)  # (oh, ow) bottom-up
+    reach_mask = np.isfinite(vf)
+    n_reach = int(reach_mask.sum())
+    if n_reach == 0:
+        sys.exit("error: 到達可能セルが 0 です（ゴールが孤立しているか field が空）。")
 
-    have_policy = (not args.no_policy) and all(
-        os.path.exists(f"{args.out_dir}/{n}") for n in ("compact_value.bin", "compact_action.bin")
-    )
-    pol = best_theta_policy(args.out_dir, ow, oh, args.nt) if have_policy else None
+    # --- 占有マップ背景（value グリッド解像度へプール） ---
+    cfg = None
+    res_grid = None
+    free_bu = None  # bottom-up free(bool)
+    if args.map:
+        if args.map.endswith((".yaml", ".yml")):
+            cfg = parse_yaml(args.map)
+            pgm_path = os.path.join(os.path.dirname(os.path.abspath(args.map)), cfg["image"])
+        else:
+            cfg = {"resolution": 0.05, "origin": [0.0, 0.0, 0.0],
+                   "occupied_thresh": 0.65, "free_thresh": 0.196, "negate": 0}
+            pgm_path = args.map
+        res_grid = cfg["resolution"] * args.scale
+        occ_bu, mow, moh = build_occupancy(load_pgm(pgm_path), args.scale, cfg,
+                                           args.unknown == "obstacle")
+        if (mow, moh) != (ow, oh):
+            print(f"WARN: map grid {mow}x{moh} != value grid {ow}x{oh} "
+                  f"(--scale {args.scale} 不一致?)。背景はベストエフォートで描画。", file=sys.stderr)
+            # value グリッドに合わせて切り詰め/パディング
+            occ_fixed = np.ones((oh, ow), dtype=bool)
+            hh, ww = min(oh, moh), min(ow, mow)
+            occ_fixed[:hh, :ww] = occ_bu[:hh, :ww]
+            occ_bu = occ_fixed
+        free_bu = ~occ_bu
 
-    ncol = 2 if pol is not None else 1
-    fig, axes = plt.subplots(1, ncol, figsize=(9.5 * ncol, 7), constrained_layout=True, squeeze=False)
-    a1 = axes[0][0]
+    # --- 表示は plot.py に合わせ top-down (origin='upper') ---
+    v_img = vf[::-1, :]                  # bottom-up -> top-down
+    free_img = free_bu[::-1, :] if free_bu is not None else None
 
-    # value: ダイナミックレンジが広い (1s〜1e6s, 壁沿い safety-penalty) ので対数表示。
-    vcmap = plt.cm.turbo.copy()
-    vcmap.set_over("magenta")  # penalty 壁 (V>1e5s)
-    vcmap.set_bad("0.15")      # 到達不能
-    im = a1.imshow(np.ma.masked_invalid(vf), origin="lower", cmap=vcmap, norm=LogNorm(vmin=1.0, vmax=1e5))
-    a1.set_facecolor("0.15")
-    a1.set_title("value  V*  (min over θ)  [s, log]   (magenta = penalty wall >1e5s)")
-    fig.colorbar(im, ax=a1, shrink=0.82, label="seconds-to-goal (log)", extend="max")
+    fin = vf[reach_mask]
+    vmax = float(np.percentile(fin, args.vmax_pct))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = float(np.nanmax(fin))
+    print(f"grid {ow}x{oh}x{args.nt}  reachable {n_reach:,} cells  "
+          f"V p50={np.percentile(fin,50):.1f}s p{args.vmax_pct:g}={vmax:.1f}s max={np.nanmax(fin):.1f}s")
 
-    if pol is not None:
-        a2 = axes[0][1]
-        pol = np.where(reach, pol, -1)
-        cmap = ListedColormap(["0.15", "#e6194b", "#42d4f4", "#3cb44b", "#4363d8", "#f58231", "#911eb4"])
-        im2 = a2.imshow(np.where(pol < 0, 0, pol + 1), origin="lower", cmap=cmap, vmin=0, vmax=6)
-        a2.set_facecolor("0.15")
-        a2.set_title("optimal action  (policy at best θ)")
-        cb = fig.colorbar(im2, ax=a2, shrink=0.82, ticks=[i + 0.5 for i in range(7)])
-        cb.ax.set_yticklabels(["(none)"] + ACTION_NAMES)
+    # --- goal / start を image(row,col) top-down へ ---
+    def world_to_img(wx, wy):
+        ix = (wx - cfg["origin"][0]) / res_grid
+        iy = (wy - cfg["origin"][1]) / res_grid
+        return (oh - 0.5) - iy, ix - 0.5  # (row, col)
 
-    for row in axes:
-        for a in row:
-            a.set_xlabel("x cell")
-            a.set_ylabel("y cell")
-    title = args.title or f"compact mapped output · {ow}×{oh}×{args.nt} = {ow * oh * args.nt / 1e6:.0f}M states"
-    fig.suptitle(title, fontsize=13)
+    if args.goal_x is not None and args.goal_y is not None and cfg is not None:
+        gr, gc = world_to_img(args.goal_x, args.goal_y)
+    else:
+        # V 最小セル（ゴールは V≈0）を bottom-up で見つけ top-down へ
+        flat = np.where(reach_mask, vf, np.inf)
+        giy, gix = np.unravel_index(np.argmin(flat), flat.shape)
+        gr, gc = oh - 1 - giy, gix
 
+    path = None
+    start_rc = None
+    if args.start_x is not None and args.start_y is not None and cfg is not None:
+        sr, sc = world_to_img(args.start_x, args.start_y)
+        sr, sc = int(round(sr)), int(round(sc))
+        sr = min(max(sr, 0), oh - 1)
+        sc = min(max(sc, 0), ow - 1)
+        if not np.isfinite(v_img[sr, sc]):  # 近傍の到達セルへスナップ
+            ys, xs = np.where(np.isfinite(v_img))
+            d = (ys - sr) ** 2 + (xs - sc) ** 2
+            sr, sc = int(ys[d.argmin()]), int(xs[d.argmin()])
+        start_rc = (sr, sc)
+        path = descend_path(v_img, sr, sc, int(round(gr)), int(round(gc)))
+
+    # --- 描画 ---
+    fig, ax = plt.subplots(figsize=(11, 7.6))
+    if free_img is not None:
+        ax.imshow(np.where(free_img, 0.92, 0.18), cmap="gray", vmin=0, vmax=1, origin="upper")
+    else:
+        ax.set_facecolor("0.85")
+        print("note: --map 未指定。壁は描けません（一様グレー背景）。", file=sys.stderr)
+    hm = ax.imshow(np.ma.masked_invalid(v_img), cmap="turbo", origin="upper",
+                   alpha=0.92, vmin=0, vmax=vmax)
+    if path is not None and len(path) > 1:
+        ax.plot(path[:, 1], path[:, 0], "-", color="white", lw=1.6, alpha=0.9,
+                label="optimal path (V descent)")
+    if start_rc is not None:
+        sv = float(v_img[start_rc])
+        ax.plot(start_rc[1], start_rc[0], "o", color="magenta", ms=13, mec="black",
+                mew=1.5, label=f"robot start (V={sv:.0f}s)", zorder=5)
+    ax.plot(gc, gr, "*", color="lime", ms=22, mec="black", mew=1.5, label="goal", zorder=5)
+
+    cb = fig.colorbar(hm, ax=ax, shrink=0.82)
+    cb.set_label(f"cost-to-go V* [s] (min over θ, P{args.vmax_pct:g} scale)")
+
+    res_str = f", {res_grid:.2f} m/cell" if res_grid is not None else ""
+    nstates = ow * oh * args.nt
+    title = args.title or (
+        f"compact mapped output ({ow}×{oh}×{args.nt} = {nstates/1e6:.0f}M states{res_str})"
+        f"\nVI value function V* (frontier2d_sparse_compact) · reachable: {n_reach:,} cells")
+    ax.set_title(title)
+    ax.set_xlabel("x [cell]")
+    ax.set_ylabel("y [cell]")
+    if path is not None or start_rc is not None:
+        ax.legend(loc="upper right", fontsize=9)
+
+    fig.tight_layout()
     out_png = args.out or f"{args.out_dir}/compact_viz.png"
-    fig.savefig(out_png, dpi=110)
+    fig.savefig(out_png, dpi=120)
     print("wrote", out_png)
 
 
