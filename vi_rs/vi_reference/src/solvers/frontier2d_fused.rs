@@ -23,15 +23,14 @@
 //!   書き手は claim ブロックにより常に 1 スレッド、値は単調減少・真固定点が下界、
 //!   終了は「1 ラウンド丸ごと無変化」(そのラウンドは並行書き込みゼロ = Bellman 整合)。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Barrier;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::params::{MAX_COST, PROB_BASE_BIT};
 use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_pad::build_precomp;
 use super::frontier2d_par::n_threads;
-use super::{displacement, seed_frontier_2d, Bitboard2D};
+use super::{async_gs_engine, displacement, seed_frontier_2d};
 
 /// 未確定/非 free の番兵。実 cp (< MAX_COST + pen 上限) と衝突しない。
 pub(crate) const UNREACHED: u64 = u64::MAX;
@@ -233,18 +232,11 @@ pub(crate) fn final_policy_fused(
     )
 }
 
-/// `frontier2d_par_unsafe` と同じ共有ポインタ束 (cand/changed、バリアで相分離)。
-#[derive(Clone, Copy)]
-struct Shared {
-    cand: *mut Vec<(u32, u32)>,
-    changed: *mut Vec<(u32, u32)>,
-}
-// SAFETY: 全アクセスはバリアで相分離され、「単一書き手 + バリア後読み」の規律を守る。
-unsafe impl Send for Shared {}
-unsafe impl Sync for Shared {}
-
 /// セット済み `ValueIterator` を penalty 融合 + 非同期 G-S 並列 frontier2d で解く。
 /// `(iters, updates, converged)`。到達可能セルの収束値・方策は本家と bit-exact。
+///
+/// 並列骨格は [`super::async_gs_engine`] が担い、ここでは cp 融合モデル固有の per-cell 評価
+/// (`before = cp − pen` 復元、`action_cost_fused`、`cp ← min_cost + pen`) だけを与える。
 pub fn frontier2d_fused_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u64, bool) {
     let g = Geom::build(vi);
     let (nx, ny, nt) = (g.nx, g.ny, g.nt);
@@ -253,151 +245,51 @@ pub fn frontier2d_fused_solve(vi: &mut ValueIterator, max_iter: u32) -> (u32, u6
 
     let mut f = Fused::build_direct(vi, &g);
     let n_pad = f.cp.len();
-    // SAFETY: AtomicU64 は u64 と同一表現 (冒頭の const assert)。scope 終了まで f.cp 本体には
+    // SAFETY: AtomicU64 は u64 と同一表現 (冒頭の const assert)。engine 終了まで f.cp 本体には
     // 触れず、全アクセスはこのビュー経由の Relaxed load/store。
     let cp_atomic: &[AtomicU64] =
         unsafe { std::slice::from_raw_parts(f.cp.as_mut_ptr().cast::<AtomicU64>(), n_pad) };
-
-    let mut cand_list: Vec<(u32, u32)> =
-        seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
-    let mut changed_lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nthreads];
-
-    let shared = Shared {
-        cand: &mut cand_list as *mut Vec<(u32, u32)>,
-        changed: changed_lists.as_mut_ptr(),
-    };
-
-    let barrier = Barrier::new(nthreads);
-    let done = AtomicBool::new(false);
-    let iters_out = AtomicU32::new(0);
-    let converged_out = AtomicBool::new(false);
-    let cursor = AtomicUsize::new(0);
-    let g_ref = &g;
     let pen_ref: &[u64] = &f.pen;
     let eval_ref: &[bool] = &f.eval_ok;
+    let g_ref = &g;
 
-    let total_updates: u64 = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|w| {
-                let barrier = &barrier;
-                let done = &done;
-                let iters_out = &iters_out;
-                let converged_out = &converged_out;
-                let cursor = &cursor;
-                scope.spawn(move || -> u64 {
-                    #[allow(clippy::redundant_locals)]
-                    let shared = shared;
-                    let mut my_updates: u64 = 0;
-                    let mut iter_count: u32 = 0;
-                    loop {
-                        // ── compute (並列・in-place 非同期書き込み) ──
-                        let cand = unsafe { &*shared.cand };
-                        let n = cand.len();
-                        // SAFETY: ワーカー w は changed[w] だけを触る（他スレッドと排他）。
-                        let my_changed = unsafe { &mut *shared.changed.add(w) };
-                        my_changed.clear();
+    let cand_list: Vec<(u32, u32)> = seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
 
-                        const BLOCK: usize = 16;
-                        loop {
-                            let s = cursor.fetch_add(BLOCK, Ordering::Relaxed);
-                            if s >= n {
-                                break;
-                            }
-                            let e = (s + BLOCK).min(n);
-                            for &(ixu, iyu) in &cand[s..e] {
-                                let (ix, iy) = (ixu as i32, iyu as i32);
-                                let pad_col = g_ref.pad_col(ix, iy);
-                                let mut cell_changed = false;
-                                for it in 0..nt {
-                                    let pad_idx = (pad_col + it as i64) as usize;
-                                    if !eval_ref[pad_idx] {
-                                        continue;
-                                    }
-                                    // 自セルは単一書き手なので最新値。before = cp − pen で復元。
-                                    let cp_self = cp_atomic[pad_idx].load(Ordering::Relaxed);
-                                    let pen_self = pen_ref[pad_idx];
-                                    let before = if cp_self == UNREACHED {
-                                        MAX_COST
-                                    } else {
-                                        cp_self.wrapping_sub(pen_self)
-                                    };
-                                    let mut min_cost = MAX_COST;
-                                    for per_theta in g_ref.precomp.iter() {
-                                        let c = action_cost_fused(
-                                            cp_atomic,
-                                            &per_theta[it as usize],
-                                            pad_col,
-                                        );
-                                        if c < min_cost {
-                                            min_cost = c;
-                                        }
-                                    }
-                                    if min_cost < before {
-                                        // claim したブロック内のセル = 単一書き手。
-                                        cp_atomic[pad_idx].store(
-                                            min_cost.wrapping_add(pen_self),
-                                            Ordering::Relaxed,
-                                        );
-                                        my_updates += 1;
-                                        cell_changed = true;
-                                    }
-                                }
-                                if cell_changed {
-                                    my_changed.push((ixu, iyu));
-                                }
-                            }
-                        }
+    // per-cell 評価 (cp 融合モデル): 自セルは単一書き手なので最新値。before = cp − pen で復元。
+    let eval = |ix: i32, iy: i32| -> (bool, u64) {
+        let pad_col = g_ref.pad_col(ix, iy);
+        let mut cell_changed = false;
+        let mut ups = 0u64;
+        for it in 0..nt {
+            let pad_idx = (pad_col + it as i64) as usize;
+            if !eval_ref[pad_idx] {
+                continue;
+            }
+            let cp_self = cp_atomic[pad_idx].load(Ordering::Relaxed);
+            let pen_self = pen_ref[pad_idx];
+            let before = if cp_self == UNREACHED {
+                MAX_COST
+            } else {
+                cp_self.wrapping_sub(pen_self)
+            };
+            let mut min_cost = MAX_COST;
+            for per_theta in g_ref.precomp.iter() {
+                let c = action_cost_fused(cp_atomic, &per_theta[it as usize], pad_col);
+                if c < min_cost {
+                    min_cost = c;
+                }
+            }
+            if min_cost < before {
+                cp_atomic[pad_idx].store(min_cost.wrapping_add(pen_self), Ordering::Relaxed);
+                ups += 1;
+                cell_changed = true;
+            }
+        }
+        (cell_changed, ups)
+    };
 
-                        barrier.wait(); // B1: 全 cp/changed 書き込みが可視。
-
-                        // ── リーダー直列: changed → 次フロンティア再構築 / 終了判定 ──
-                        if w == 0 {
-                            iter_count += 1;
-                            let mut any = false;
-                            let mut nf = Bitboard2D::new(nx as u32, ny as u32);
-                            for i in 0..nthreads {
-                                // SAFETY: B1 後、各 changed[i] への書きは完了し可視。
-                                let cl = unsafe { &*shared.changed.add(i) };
-                                if !cl.is_empty() {
-                                    any = true;
-                                }
-                                for &(ixu, iyu) in cl {
-                                    nf.set(ixu, iyu);
-                                }
-                            }
-                            if any && iter_count < max_iter {
-                                let mut next: Vec<(u32, u32)> =
-                                    nf.dilate(dx, dy).enumerate().collect();
-                                // 対称 G-S 風: 走査方向をラウンドごとに反転。
-                                if iter_count % 2 == 1 {
-                                    next.reverse();
-                                }
-                                // SAFETY: 他ワーカーは B1〜B2 間 cand を読まない。
-                                unsafe {
-                                    *shared.cand = next;
-                                }
-                                cursor.store(0, Ordering::Relaxed);
-                            } else {
-                                iters_out.store(iter_count, Ordering::Relaxed);
-                                converged_out.store(!any, Ordering::Relaxed);
-                                done.store(true, Ordering::Relaxed);
-                            }
-                        }
-
-                        barrier.wait(); // B2: リーダーの cand 差し替え / done が可視。
-                        if done.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    my_updates
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
-    });
-
-    let iters = iters_out.load(Ordering::Relaxed);
-    let converged = converged_out.load(Ordering::Relaxed);
+    let (iters, total_updates, converged) =
+        async_gs_engine(nx, ny, dx, dy, nthreads, max_iter, cand_list, eval);
 
     // 方策は cp から最終 argmin、書き戻しは行バンド並列。
     let opt = final_policy_fused(&g, &f, nthreads, converged);
