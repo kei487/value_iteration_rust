@@ -16,6 +16,8 @@
 //! スキャン + ウォーターマーク finalization + ブロック退避。**S3b(本コミット)** 遅延確保で peak
 //! RAM を band に抑える。後続: ディスク mmap → 並列化 → CLI。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::params::MAX_COST;
 use crate::state::State;
 use crate::value_iterator::ValueIterator;
@@ -209,6 +211,84 @@ impl BlockStore {
     fn resident_blocks(&self) -> usize {
         self.blocks.iter().filter(|b| b.is_some()).count()
     }
+
+    /// 並列非同期 G-S 用に、確保済みブロックの cp/pen/eval の生ポインタ表を作る（未確保は null）。
+    /// 返り値の `AtomicCpView` は当該ラウンド中（ブロックの確保/退避が起きない間）のみ有効。cp は
+    /// `AtomicU64` として in-place 原子書き込みし、pen/eval は読み取り専用。`Block::cp` は同ラウンド
+    /// 中に再確保（move）されないので生ポインタは安定（`Vec<u64>` と `AtomicU64` は同一表現）。
+    fn atomic_view(&mut self) -> AtomicCpView {
+        let nb = self.blocks.len();
+        let mut cp = Vec::with_capacity(nb);
+        let mut pen = Vec::with_capacity(nb);
+        let mut eval = Vec::with_capacity(nb);
+        for b in self.blocks.iter_mut() {
+            match b {
+                Some(blk) => {
+                    cp.push(blk.cp.as_mut_ptr().cast::<AtomicU64>());
+                    pen.push(blk.pen.as_ptr());
+                    eval.push(blk.eval.as_ptr());
+                }
+                None => {
+                    cp.push(std::ptr::null_mut());
+                    pen.push(std::ptr::null());
+                    eval.push(std::ptr::null());
+                }
+            }
+        }
+        AtomicCpView { cp, pen, eval, chunk: self.chunk }
+    }
+}
+
+// AtomicU64 は u64 と同一表現（cp の生ポインタを AtomicU64 として読み書きする前提）。
+const _: () = assert!(
+    std::mem::size_of::<AtomicU64>() == std::mem::size_of::<u64>()
+        && std::mem::align_of::<AtomicU64>() == std::mem::align_of::<u64>()
+);
+
+/// `BlockStore` のブロック別 cp/pen/eval を生ポインタ表で束ねた並列ビュー（非同期 G-S 用）。cp は
+/// `Relaxed` 原子で in-place 読み書き、pen/eval は読み取り専用。フラット索引 `i` を `(block, offset)`
+/// に分解してアクセスする。`CpCells` を実装するので `action_cost_fused` がそのまま使える。
+///
+/// SAFETY: 当該ラウンド中はブロックの確保/退避が無く `Block::cp/pen/eval` のバッファは move されない。
+/// 列ごとに書き手は 1 スレッド（frontier をチャンク分割し列を排他割り当て）なので、同一セルへの
+/// 競合書き込みは無い。隣接読みは別列の原子 load（Relaxed）で、G-S は stale read を許容する。よって
+/// `frontier2d_fused` の `&[AtomicU64]` ビューと同じ健全性が成り立つ（固定点は単調降下で一意）。
+struct AtomicCpView {
+    cp: Vec<*mut AtomicU64>,
+    pen: Vec<*const u64>,
+    eval: Vec<*const bool>,
+    chunk: usize,
+}
+
+// SAFETY: 全アクセスは原子（cp）または読み取り専用（pen/eval）で、列ごと単一書き手の規律を守る。
+unsafe impl Send for AtomicCpView {}
+unsafe impl Sync for AtomicCpView {}
+
+impl AtomicCpView {
+    #[inline(always)]
+    fn store(&self, i: usize, v: u64) {
+        let b = i / self.chunk;
+        // SAFETY: 確保済みブロックのみアクセス（ensure_window 済）、offset は chunk 内、AtomicU64==u64。
+        unsafe { (*self.cp[b].add(i - b * self.chunk)).store(v, Ordering::Relaxed) }
+    }
+    #[inline(always)]
+    fn pen(&self, i: usize) -> u64 {
+        let b = i / self.chunk;
+        unsafe { *self.pen[b].add(i - b * self.chunk) }
+    }
+    #[inline(always)]
+    fn eval_ok(&self, i: usize) -> bool {
+        let b = i / self.chunk;
+        unsafe { *self.eval[b].add(i - b * self.chunk) }
+    }
+}
+
+impl CpCells for AtomicCpView {
+    #[inline(always)]
+    fn get(&self, i: usize) -> u64 {
+        let b = i / self.chunk;
+        unsafe { (*self.cp[b].add(i - b * self.chunk)).load(Ordering::Relaxed) }
+    }
 }
 
 /// 値バンド幅 `Δ_band`。`COUPLE_SAFETY · max(mx,my) · max_pen`。
@@ -295,48 +375,37 @@ fn relax_column(
     (changed, mn, mx, ups)
 }
 
-/// 並列 Jacobi の 1 列分 compute 結果。`updates` は減少した θ の `(pad_idx, 新 cp)`。
-/// `mn`/`mx` は更新後の列値域、`changed` は減少 θ があったか。
-struct ColResult {
-    ixu: u32,
-    iyu: u32,
-    updates: Vec<(usize, u64)>,
-    mn: u64,
-    mx: u64,
-    changed: bool,
-}
-
-/// 列 (ix,iy) の全 θ を Bellman 更新するが**書き込まない**（read-only スナップショット読み）。
-/// 並列フェーズで使う Jacobi 版 `relax_column`：隣接は更新前の値で評価され、減少分は `updates`
-/// に集めて直列フェーズで一括 apply する。固定点が一意（更新順序非依存）なので最終値は G-S 版と
-/// bit-exact。窓ブロックは呼び出し前に `ensure_window` で確保済みである前提。`mn`/`mx` は更新後の
-/// 値域（`column_range` と同じく到達済み = `value != MAX_COST` のセルのみ集計）。
-fn compute_column_jacobi(store: &BlockStore, g: &Geom, ix: i32, iy: i32) -> ColResult {
+/// 列 (ix,iy) の全 θ を Bellman 更新し、減少分を `view` へ **in-place 原子書き込み**する（非同期
+/// G-S）。`relax_column` の並列版で、隣接は他スレッドの最新書き込みも見え得る（async = G-S 同等の
+/// 速い収束、Jacobi のような全列スナップショットの iters 増が無い）。列 (ix,iy) のセルの書き手は
+/// 常にこのスレッドだけ（frontier をチャンク分割し列を排他割り当て）なので競合書き込みは無い。
+/// 戻り値 `(更新後 min, 更新後 max, 減少 θ 数)`。窓ブロックは呼び出し前に `ensure_window` 済み前提。
+/// `mn`/`mx` は自列セルのみから集計（自列は単一書き手なので一貫読み）＝ `column_range` と同義。
+fn relax_column_async(view: &AtomicCpView, g: &Geom, ix: i32, iy: i32) -> (u64, u64, u64) {
     let pad_col = g.pad_col(ix, iy);
-    let mut updates: Vec<(usize, u64)> = Vec::new();
-    let mut changed = false;
+    let mut ups = 0u64;
     let (mut mn, mut mx) = (MAX_COST, MAX_COST);
     let mut first = true;
     for it in 0..g.nt {
         let pad_idx = (pad_col + it as i64) as usize;
-        let cp_self = store.get(pad_idx);
-        let pen_self = store.pen(pad_idx);
+        let cp_self = view.get(pad_idx);
+        let pen_self = view.pen(pad_idx);
         let cur_v = if cp_self == UNREACHED {
             MAX_COST
         } else {
             cp_self.wrapping_sub(pen_self)
         };
-        let new_v = if store.eval_ok(pad_idx) {
+        let new_v = if view.eval_ok(pad_idx) {
             let mut min_cost = MAX_COST;
             for per_theta in g.precomp.iter() {
-                let c = action_cost_fused(store, &per_theta[it as usize], pad_col);
+                let c = action_cost_fused(view, &per_theta[it as usize], pad_col);
                 if c < min_cost {
                     min_cost = c;
                 }
             }
             if min_cost < cur_v {
-                updates.push((pad_idx, min_cost.wrapping_add(pen_self)));
-                changed = true;
+                view.store(pad_idx, min_cost.wrapping_add(pen_self)); // in-place 原子書き込み。
+                ups += 1;
                 min_cost
             } else {
                 cur_v
@@ -355,7 +424,7 @@ fn compute_column_jacobi(store: &BlockStore, g: &Geom, ix: i32, iy: i32) -> ColR
             }
         }
     }
-    ColResult { ixu: ix as u32, iyu: iy as u32, updates, mn, mx, changed }
+    (mn, mx, ups)
 }
 
 /// 列 (ix,iy) を final 化する。到達済みセルの (value, policy) を出力配列へ確定保存し（退避後に
@@ -525,14 +594,15 @@ fn converge_band_serial(
     }
 }
 
-/// 波内バンドを**決定的並列 Jacobi** で収束させる（`converge_band_serial` と同じ事後状態・収束値、
-/// bit-exact）。`frontier2d_par` と同じ三相: ① 直列で frontier 全列の窓ブロックを `ensure_window`
-/// 確保（compute は read-only なのでここで確保しておく）② 各ワーカーが `&store` を**読み取り専用**
-/// で参照し担当列チャンクの新値を計算（Jacobi スナップショット読み = スレッド数・分割非依存）
-/// ③ join 後に直列で cp を書き戻し col_min/col_max/live/次フロンティアを構築。固定点が一意なので
-/// 並列でも最終値は G-S と bit-exact。unsafe 不使用（`&BlockStore` は内部可変性なしで `Sync`）。
+/// 波内バンドを**並列非同期 Gauss–Seidel** で収束させる（`converge_band_serial` と同じ事後状態・
+/// 収束値、bit-exact）。`frontier2d_fused` と同じ async 方式: ① 直列で frontier 全列の窓ブロックを
+/// `ensure_window` 確保 ② 確保済みブロックの cp/pen/eval 生ポインタ表（`AtomicCpView`）を作り、各
+/// ワーカーが担当列チャンクを relax して cp を **in-place 原子書き込み**（隣接は他スレッドの最新値も
+/// 見え得る = G-S 同等の速い収束。Jacobi のような全列スナップショットの iters 増が無い）③ join 後に
+/// 直列で col_min/col_max/live/次フロンティアを構築（cp は②で確定済み）。列ごと単一書き手なので
+/// 同一セル競合は無く、固定点は単調降下で一意なため最終値は G-S と bit-exact（iters は非決定的）。
 #[allow(clippy::too_many_arguments)]
-fn converge_band_parallel(
+fn converge_band_async(
     store: &mut BlockStore,
     g: &Geom,
     states: &[State],
@@ -554,29 +624,35 @@ fn converge_band_parallel(
 ) -> bool {
     let cidx = |ix: i32, iy: i32| (iy * nx + ix) as usize;
     loop {
-        // ① 直列: frontier 全列の窓ブロックを確保（並列 compute 中は store を書けないため）。
+        // ① 直列: frontier 全列の窓ブロックを確保（並列 compute 中は確保/退避できないため）。
         for &(ixu, iyu) in frontier.iter() {
             ensure_window(store, ixu as i32, iyu as i32, states);
         }
-        // ② 並列 compute（read-only &store・決定的 Jacobi）。各列は 1 チャンク = 1 スレッドが担当
-        //    し pad_idx は列ごとに排他なので、書き戻し（③）に競合はない。
-        let chunk = frontier.len().div_ceil(nthreads).max(1);
-        let results: Vec<Vec<ColResult>> = {
-            let store_ref: &BlockStore = store;
+        // ② 並列 async G-S compute（in-place 原子書き込み）。各列は 1 チャンク = 1 スレッドが排他
+        //    担当（単一書き手）。戻り値は列ごとの `(i, mn, mx, ups)`。view は store の生ポインタ表で、
+        //    本スコープ中は store を借用しない（確保/退避なし）ので alias 問題は無い。
+        let view = store.atomic_view();
+        // フロンティアが薄いラウンドでは、過剰なスレッド spawn（毎ラウンド再 spawn）を避けるため
+        // 1 スレッドあたり最低 MIN_COLS_PER_THREAD 列を割り当てる範囲に実効スレッド数を抑える。
+        const MIN_COLS_PER_THREAD: usize = 64;
+        let eff = nthreads.min((frontier.len() / MIN_COLS_PER_THREAD).max(1));
+        let chunk = frontier.len().div_ceil(eff).max(1);
+        let results: Vec<Vec<(usize, u64, u64, u64)>> = {
+            let view_ref = &view;
             std::thread::scope(|scope| {
                 let handles: Vec<_> = frontier
                     .chunks(chunk)
                     .map(|part| {
                         scope.spawn(move || {
-                            let mut out: Vec<ColResult> = Vec::new();
+                            let mut out: Vec<(usize, u64, u64, u64)> = Vec::new();
                             for &(ixu, iyu) in part {
                                 let i = (iyu as i32 * nx + ixu as i32) as usize;
                                 if col_final[i] {
                                     continue;
                                 }
-                                out.push(compute_column_jacobi(
-                                    store_ref, g, ixu as i32, iyu as i32,
-                                ));
+                                let (mn, mx, ups) =
+                                    relax_column_async(view_ref, g, ixu as i32, iyu as i32);
+                                out.push((i, mn, mx, ups));
                             }
                             out
                         })
@@ -585,27 +661,26 @@ fn converge_band_parallel(
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         };
-        // ③ 直列 apply: cp 書き戻し + col_min/col_max/live/次フロンティア構築。
+        drop(view); // 生ポインタ表を破棄してから store を可変借用する。
+        // ③ 直列 apply: col_min/col_max/live/次フロンティア構築（cp は②で確定済み）。
         let mut changed = Bitboard2D::new(nx as u32, ny as u32);
         let mut any = false;
         for part in &results {
-            for r in part {
-                let i = cidx(r.ixu as i32, r.iyu as i32);
-                col_min[i] = r.mn;
-                col_max[i] = r.mx;
-                if r.mn != MAX_COST && !reached[i] {
+            for &(i, mn, mx, ups) in part {
+                col_min[i] = mn;
+                col_max[i] = mx;
+                if mn != MAX_COST && !reached[i] {
                     reached[i] = true;
                     live.push(i);
                 }
-                for &(pad_idx, new_cp) in &r.updates {
-                    store.set_cp(pad_idx, new_cp);
-                    *total_updates += 1;
-                }
-                if r.changed {
+                *total_updates += ups;
+                if ups > 0 {
                     any = true;
                 }
-                if r.mn != MAX_COST && r.mn < t {
-                    changed.set(r.ixu, r.iyu);
+                if mn != MAX_COST && mn < t {
+                    let ix = (i % nx as usize) as u32;
+                    let iy = (i / nx as usize) as u32;
+                    changed.set(ix, iy);
                 }
             }
         }
@@ -656,8 +731,9 @@ pub fn solve_compact_into(
 }
 
 /// `solve_compact_into` のスレッド数明示版。`nthreads == 1` は直列 G-S、`>= 2` は波内 relax を
-/// 決定的並列 Jacobi（`converge_band_parallel`）で回す。固定点は一意なので結果はスレッド数に依らず
-/// bit-exact（テストが 1/4 両方を固定して検証する）。
+/// 並列非同期 G-S（`converge_band_async`、cp を in-place 原子書き込み）で回す。固定点は単調降下で
+/// 一意なので、収束値・方策はスレッド数に依らず本家と bit-exact（iters は非決定的）。テストが
+/// nthreads 1/4 両方を固定して value+policy parity を検証する。
 pub(crate) fn solve_compact_into_nthreads(
     vi: &mut ValueIterator,
     max_iter: u32,
@@ -718,7 +794,7 @@ pub(crate) fn solve_compact_into_nthreads(
         // ── 波: バンド [.., t) を収束。relax は隣接（未到達含む）を発見、伝播は in-band 列のみ。
         //    nthreads==1 は直列 G-S、>=2 は並列 Jacobi。max_iter 到達なら 'outer を false で抜ける。 ──
         let band_ok = if nthreads >= 2 {
-            converge_band_parallel(
+            converge_band_async(
                 &mut store, &g, states, nthreads, nx, ny, dx, dy, t, max_iter, &mut frontier,
                 &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
                 &mut total_updates,
@@ -871,8 +947,8 @@ mod tests {
         });
     }
 
-    /// 並列 Jacobi パス（nthreads==4）を固定して value+policy parity を検証。固定点は一意なので
-    /// スレッド数・チャンク分割に依らず本家と bit-exact（決定的 Jacobi）。
+    /// 並列非同期 G-S パス（nthreads==4）を固定して value+policy parity を検証。固定点は単調降下で
+    /// 一意なのでスレッド数・チャンク分割・スケジュールに依らず収束値・方策は本家と bit-exact。
     #[test]
     fn parity_parallel_nthreads4_compact() {
         crate::solvers::test_support::parity_standard_maps(|vi| {
@@ -882,8 +958,8 @@ mod tests {
         });
     }
 
-    /// 複数行ブロックに跨る大きめ空マップ × 並列 Jacobi（nthreads==4）で、チャンク境界を跨ぐ
-    /// スナップショット読み（隣接列が別スレッド担当）と退避を同時に刺激し bit-exact を確認。
+    /// 複数行ブロックに跨る大きめ空マップ × 並列非同期 G-S（nthreads==4）で、チャンク境界を跨ぐ
+    /// 原子 in-place 書き込み・隣接読み（別スレッド担当列）と退避を同時に刺激し bit-exact を確認。
     #[test]
     fn parity_parallel_larger_nthreads4_compact() {
         use crate::solvers::test_support::{make_vi, run_reference_to_fixed_point, REACH};
