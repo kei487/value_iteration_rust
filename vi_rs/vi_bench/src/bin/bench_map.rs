@@ -666,7 +666,10 @@ fn main() -> ExitCode {
         );
         // 結果値の参照: 非 compact は vi.states、compact(mapped) は sink（orig 索引は同一順序）。
         let value_at = |ix: i32, iy: i32, it: i32| -> u64 {
-            let orig = (it + ix * THETA_CELL_NUM + iy * THETA_CELL_NUM * ow) as usize;
+            // usize 演算（i32 だと iy*THETA*ow が巨大マップで i32 オーバーフロー）。
+            let orig = it as usize
+                + ix as usize * THETA_CELL_NUM as usize
+                + iy as usize * THETA_CELL_NUM as usize * ow as usize;
             if let Some(vi) = &solved_vi {
                 vi.states[orig].total_cost
             } else if let Some(sink) = &compact_sink {

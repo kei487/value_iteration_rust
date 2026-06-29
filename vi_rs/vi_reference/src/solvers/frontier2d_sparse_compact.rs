@@ -52,6 +52,14 @@ pub(crate) trait StateSource {
     fn for_each_free(&self, f: &mut dyn FnMut(i32, i32));
 }
 
+/// orig 索引 `it + ix·nt + iy·nx·nt` を **usize で**計算する。i32 演算だと nstates が i32::MAX
+/// (≈2.1e9) を超える巨大マップ（フル解像度 tsukuba 13250×7100×60 = 5.6e9 states）で `iy·nt·nx` が
+/// オーバーフローして負にラップ → スライス範囲外 panic になるため、必ずこの関数を通す。
+#[inline]
+fn orig_index(ix: i32, iy: i32, it: i32, nx: i32, nt: i32) -> usize {
+    it as usize + ix as usize * nt as usize + iy as usize * nx as usize * nt as usize
+}
+
 /// `states` 配列をそのまま源にする（既存挙動）。full states 常駐・write_back あり経路で使う。
 pub(crate) struct SliceSource<'a> {
     states: &'a [State],
@@ -73,7 +81,7 @@ impl<'a> SliceSource<'a> {
     }
     #[inline]
     fn orig(&self, ix: i32, iy: i32, it: i32) -> usize {
-        (it + ix * self.nt + iy * self.nx * self.nt) as usize
+        orig_index(ix, iy, it, self.nx, self.nt)
     }
 }
 
@@ -162,7 +170,7 @@ impl MapSource {
     }
     #[inline]
     fn orig(&self, ix: i32, iy: i32, it: i32) -> i64 {
-        (it + ix * self.nt + iy * self.nx * self.nt) as i64
+        orig_index(ix, iy, it, self.nx, self.nt) as i64
     }
 }
 
@@ -244,7 +252,7 @@ fn compute_finals(vi: &ValueIterator, free: &[bool]) -> HashSet<i64> {
                 let ok = (gt - gm <= t0 && t1 <= gt + gm)
                     || (goal_t_2 - gm <= t0 && t1 <= goal_t_2 + gm);
                 if ok {
-                    set.insert((it + ix * nt + iy * nx * nt) as i64);
+                    set.insert(orig_index(ix, iy, it, nx, nt) as i64);
                 }
             }
         }
@@ -725,7 +733,7 @@ fn finalize_column(
         }
         // 非 eval（ゴール）: action は -1（None）、value はピン留め値。
     }
-    let base = (ix * nt + iy * nt * nx) as usize; // orig(it=0)
+    let base = orig_index(ix, iy, 0, nx, nt); // orig(it=0)
     sink.write_column(base, &buf_v, &buf_a);
     cnt
 }
@@ -1298,7 +1306,7 @@ fn solve_compact_core(
 fn write_back_sink(vi: &mut ValueIterator, g: &Geom, sink: &dyn CompactSink) {
     let (nt, nx) = (g.nt, g.nx);
     for s in vi.states.iter_mut() {
-        let orig = (s.it + s.ix * nt + s.iy * nt * nx) as usize;
+        let orig = orig_index(s.ix, s.iy, s.it, nx, nt);
         let (v, a) = sink.read(orig);
         s.total_cost = v;
         s.optimal_action = if a < 0 { None } else { Some(a as usize) };
@@ -1478,6 +1486,24 @@ mod tests {
             stats.peak_resident_blocks < stats.total_blocks,
             "peak 常駐ブロックが総ブロックを下回るべき (peak={}, total={})",
             stats.peak_resident_blocks, stats.total_blocks
+        );
+    }
+
+    /// 回帰: フル解像度 tsukuba 規模（nx=13250, ny=7100, nt=60, nstates=5.6e9 > i32::MAX）で orig
+    /// 索引が i32 オーバーフローしないこと。pve1ubuntu のフル解像度ランが旧 i32 演算で `iy·nt·nx` が
+    /// 負にラップして MmapSink スライス範囲外 panic した実バグの回帰ガード。
+    #[test]
+    fn orig_index_no_i32_overflow_large_map() {
+        let (nx, nt) = (13250i32, 60i32);
+        let iy = 7099i32; // 最終行付近
+        let got = orig_index(0, iy, 0, nx, nt);
+        let want = iy as usize * nx as usize * nt as usize; // 5,643,705,000
+        assert_eq!(got, want);
+        assert!(got > i32::MAX as usize, "index は i32::MAX (={}) を超えるはず", i32::MAX);
+        // it/ix 成分も含めた一般形。
+        assert_eq!(
+            orig_index(13249, 7099, 59, nx, nt),
+            59usize + 13249 * 60 + 7099 * 13250 * 60
         );
     }
 
