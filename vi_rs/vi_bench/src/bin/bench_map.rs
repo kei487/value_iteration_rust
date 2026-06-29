@@ -119,9 +119,14 @@ struct Args {
     #[arg(long, default_value_t = 100000.0)]
     safety_penalty: f64,
 
-    /// Which solver(s) to run.
-    #[arg(long, value_enum, default_value_t = SolverSel::Both)]
+    /// Which solver(s) to run (preset combinations).
+    #[arg(long, value_enum, default_value_t = SolverSel::Both, conflicts_with = "solver_name")]
     solver: SolverSel,
+
+    /// Arbitrary u64 solver name (`U64Solver::from_name`, e.g. `frontier2d`, `block_refine`).
+    /// Overrides `--solver` when set. See `vi_reference::solvers::U64Solver::from_name`.
+    #[arg(long, conflicts_with = "solver")]
+    solver_name: Option<String>,
 
     /// Sweep budget cap for Reference (terminates even without convergence).
     #[arg(long, default_value_t = 2000)]
@@ -195,7 +200,7 @@ enum SolverSel {
 
 /// One solver's measurement.
 struct Row {
-    solver: &'static str,
+    solver: String,
     iters: u32,
     updates: u64,
     total_ms: f64,
@@ -537,39 +542,63 @@ fn main() -> ExitCode {
     }
 
     // --- Build solver schedule ---
-    let mut schedule: Vec<(&'static str, U64Solver, u32)> = Vec::new();
-    let want_ref = matches!(args.solver, SolverSel::Reference | SolverSel::Both);
-    let want_fr = matches!(args.solver, SolverSel::Frontier3d | SolverSel::Both);
-    if want_ref {
-        schedule.push(("reference", U64Solver::Reference, args.max_sweeps));
-    }
-    if want_fr {
-        schedule.push(("frontier3d", U64Solver::Frontier3D, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dPar) {
-        schedule.push(("frontier2d_par", U64Solver::Frontier2DPar, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dParUnsafe) {
-        schedule.push((
-            "frontier2d_par_unsafe",
-            U64Solver::Frontier2DParUnsafe,
-            args.max_iters,
-        ));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dFused) {
-        schedule.push(("frontier2d_fused", U64Solver::Frontier2DFused, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dSparse) {
-        schedule.push(("frontier2d_sparse", U64Solver::Frontier2DSparse, args.max_iters));
-    }
-    if matches!(args.solver, SolverSel::Frontier2dSparseCompact) {
-        schedule.push((
-            "frontier2d_sparse_compact",
-            U64Solver::Frontier2DSparseCompact { band: args.compact_band },
-            args.max_iters,
-        ));
+    let mut schedule: Vec<(String, U64Solver, u32)> = Vec::new();
+    if let Some(name) = &args.solver_name {
+        let solver = U64Solver::from_name(name).unwrap_or_else(|| {
+            eprintln!("error: unknown solver '{name}' (see U64Solver::from_name)");
+            std::process::exit(2);
+        });
+        let budget = if name == "reference" {
+            args.max_sweeps
+        } else {
+            args.max_iters
+        };
+        schedule.push((name.clone(), solver, budget));
+    } else {
+        let want_ref = matches!(args.solver, SolverSel::Reference | SolverSel::Both);
+        let want_fr = matches!(args.solver, SolverSel::Frontier3d | SolverSel::Both);
+        if want_ref {
+            schedule.push(("reference".into(), U64Solver::Reference, args.max_sweeps));
+        }
+        if want_fr {
+            schedule.push(("frontier3d".into(), U64Solver::Frontier3D, args.max_iters));
+        }
+        if matches!(args.solver, SolverSel::Frontier2dPar) {
+            schedule.push(("frontier2d_par".into(), U64Solver::Frontier2DPar, args.max_iters));
+        }
+        if matches!(args.solver, SolverSel::Frontier2dParUnsafe) {
+            schedule.push((
+                "frontier2d_par_unsafe".into(),
+                U64Solver::Frontier2DParUnsafe,
+                args.max_iters,
+            ));
+        }
+        if matches!(args.solver, SolverSel::Frontier2dFused) {
+            schedule.push((
+                "frontier2d_fused".into(),
+                U64Solver::Frontier2DFused,
+                args.max_iters,
+            ));
+        }
+        if matches!(args.solver, SolverSel::Frontier2dSparse) {
+            schedule.push((
+                "frontier2d_sparse".into(),
+                U64Solver::Frontier2DSparse,
+                args.max_iters,
+            ));
+        }
+        if matches!(args.solver, SolverSel::Frontier2dSparseCompact) {
+            schedule.push((
+                "frontier2d_sparse_compact".into(),
+                U64Solver::Frontier2DSparseCompact { band: args.compact_band },
+                args.max_iters,
+            ));
+        }
     }
 
+    let want_ref = schedule
+        .iter()
+        .any(|(n, _, _)| n == "reference");
     if want_ref && states > 100_000_000 {
         eprintln!(
             "WARNING: reference on {} states will likely hit the --max-sweeps cap ({}) before \
@@ -650,7 +679,7 @@ fn main() -> ExitCode {
         };
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let row = Row {
-            solver: sel,
+            solver: sel.clone(),
             iters: stats.iters,
             updates: stats.updates,
             total_ms: ms,

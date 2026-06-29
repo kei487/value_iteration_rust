@@ -88,7 +88,7 @@ matlab-codegen-clean:
 
 # ---------- Rust (vi_rs workspace) ----------
 
-.PHONY: rs-test rs-bench rs-bench-summary rs-bench-parallel
+.PHONY: rs-test rs-bench rs-bench-summary rs-bench-parallel rs-run
 
 rs-test:
 	cd vi_rs && cargo test --workspace
@@ -105,6 +105,11 @@ rs-bench-parallel:
 	cd vi_rs && cargo run --release -p vi_bench --features parallel \
 	    --bin bench_summary -- --parallel --markdown \
 	    --out target/bench_results/summary_parallel_$(shell date +%Y%m%d_%H%M%S).csv
+
+# Run Rust u64 VI on a bundled map (default: tiny). Override: make rs-run ARGS="--preset house --solver block_refine"
+ARGS ?=
+rs-run:
+	bash scripts/run_vi_rust.sh $(ARGS)
 
 # ---------- Clean ----------
 
