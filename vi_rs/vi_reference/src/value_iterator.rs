@@ -143,6 +143,30 @@ impl ValueIterator {
         self.set_sweep_orders();
     }
 
+    /// geometry（cell_num_*/resolution/origin）と遷移テーブルだけを設定し、`states`（O(total)）も
+    /// `sweep_orders`（O(total)）も**作らない**。アウトオブコアの `solve_compact_mapped` 用：states を
+    /// 持たずに `Geom::build` / `displacement` / `MapSource` を構成できるだけの最小状態を整える。
+    pub fn set_map_geometry_no_states(
+        &mut self,
+        map: &OccupancyGrid,
+        theta_cell_num: i32,
+        goal_margin_radius: f64,
+        goal_margin_theta: i32,
+    ) {
+        self.cell_num_t = theta_cell_num;
+        self.goal_margin_radius = goal_margin_radius;
+        self.goal_margin_theta = goal_margin_theta;
+        self.cell_num_x = map.width;
+        self.cell_num_y = map.height;
+        self.xy_resolution = map.resolution;
+        self.t_resolution = (360 / self.cell_num_t) as f64;
+        self.map_origin_x = map.origin_x;
+        self.map_origin_y = map.origin_y;
+        self.map_origin_quat = map.origin_quat.clone();
+        self.set_state_transition();
+        // set_state / set_sweep_orders は呼ばない（compact は states/sweep_orders を使わない）。
+    }
+
     /// 本家 `setState`。
     fn set_state(&mut self, map: &OccupancyGrid, safety_radius: f64, safety_radius_penalty: f64) {
         let margin = (safety_radius / self.xy_resolution).ceil() as i32;

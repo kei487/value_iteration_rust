@@ -16,15 +16,241 @@
 //! スキャン + ウォーターマーク finalization + ブロック退避。**S3b(本コミット)** 遅延確保で peak
 //! RAM を band に抑える。後続: ディスク mmap → 並列化 → CLI。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::action::Action;
+use crate::msg::OccupancyGrid;
 use crate::params::MAX_COST;
 use crate::state::State;
 use crate::value_iterator::ValueIterator;
 
 use super::frontier2d_fused::{action_cost_fused, CpCells, Geom, UNREACHED};
 use super::frontier2d_par::n_threads;
-use super::{displacement, seed_frontier_2d, Bitboard2D};
+use super::{displacement, Bitboard2D};
+
+/// compact が per-state に読む情報の抽象源。O(total) の `states` 配列を常駐させる `SliceSource` と、
+/// マップから 2D の free/penalty（θ 非依存）＋ ゴール近傍の final 集合だけを保持する `MapSource` を
+/// 差し替えられる。`MapSource` は O(total) を持たないので、巨大マップでもメモリ床が O(nx·ny) になる。
+///
+/// compact が読むのは「(x,y) の penalty/free（θ 非依存）」「(x,y,θ) の final_state（ゴール局所）」
+/// だけ。seed（total_cost<MAX = final）は `for_each_seed` で列挙、free 列は `for_each_free` で列挙する
+/// （どちらも MapSource では全走査を避けられる）。本家 `State::from_occupancy` / `setStateValues` の式を
+/// そのまま再利用するので、両源は per-cell で bit-exact 一致する（parity テストで検証）。
+pub(crate) trait StateSource {
+    /// セル (ix,iy) の `penalty +ʷ local_penalty`（θ 非依存、local_penalty は常に 0）。
+    fn pen(&self, ix: i32, iy: i32) -> u64;
+    /// セル (ix,iy) が自由か（`map.data==0`、θ 非依存）。
+    fn free(&self, ix: i32, iy: i32) -> bool;
+    /// (ix,iy,it) が goal final セルか（本家 `setStateValues` の距離+向き判定）。
+    fn is_final(&self, ix: i32, iy: i32, it: i32) -> bool;
+    /// 全セルの penalty 最大（値バンド幅算出用、占有 PROB_BASE も含む）。
+    fn max_pen(&self) -> u64;
+    /// seed（final）セル (ix,iy,it) を列挙する（ゴール局所）。
+    fn for_each_seed(&self, f: &mut dyn FnMut(i32, i32, i32));
+    /// free な (ix,iy) を列挙する（2D、n_eval 算出用）。
+    fn for_each_free(&self, f: &mut dyn FnMut(i32, i32));
+}
+
+/// `states` 配列をそのまま源にする（既存挙動）。full states 常駐・write_back あり経路で使う。
+pub(crate) struct SliceSource<'a> {
+    states: &'a [State],
+    nx: i32,
+    nt: i32,
+    max_pen: u64,
+}
+
+impl<'a> SliceSource<'a> {
+    fn new(states: &'a [State], nx: i32, nt: i32) -> Self {
+        let mut max_pen = 0u64;
+        for s in states {
+            let p = s.penalty.wrapping_add(s.local_penalty);
+            if p > max_pen {
+                max_pen = p;
+            }
+        }
+        Self { states, nx, nt, max_pen }
+    }
+    #[inline]
+    fn orig(&self, ix: i32, iy: i32, it: i32) -> usize {
+        (it + ix * self.nt + iy * self.nx * self.nt) as usize
+    }
+}
+
+impl StateSource for SliceSource<'_> {
+    #[inline]
+    fn pen(&self, ix: i32, iy: i32) -> u64 {
+        let s = &self.states[self.orig(ix, iy, 0)];
+        s.penalty.wrapping_add(s.local_penalty)
+    }
+    #[inline]
+    fn free(&self, ix: i32, iy: i32) -> bool {
+        self.states[self.orig(ix, iy, 0)].free
+    }
+    #[inline]
+    fn is_final(&self, ix: i32, iy: i32, it: i32) -> bool {
+        self.states[self.orig(ix, iy, it)].final_state
+    }
+    #[inline]
+    fn max_pen(&self) -> u64 {
+        self.max_pen
+    }
+    fn for_each_seed(&self, f: &mut dyn FnMut(i32, i32, i32)) {
+        for s in self.states {
+            if s.total_cost < MAX_COST {
+                f(s.ix, s.iy, s.it);
+            }
+        }
+    }
+    fn for_each_free(&self, f: &mut dyn FnMut(i32, i32)) {
+        for s in self.states {
+            if s.it == 0 && s.free {
+                f(s.ix, s.iy);
+            }
+        }
+    }
+}
+
+/// マップから 2D の free/penalty とゴール近傍の final 集合だけを構築する源（O(nx·ny) メモリ）。
+/// O(total) の states を持たないので巨大マップでもメモリ床が下がる。
+pub(crate) struct MapSource {
+    nx: i32,
+    ny: i32,
+    nt: i32,
+    /// (ix,iy) の free（`map.data==0`）。
+    free: Vec<bool>,
+    /// (ix,iy) の `penalty`（local_penalty=0）。本家 `State::from_occupancy` の margin ループそのまま。
+    pen2d: Vec<u64>,
+    max_pen: u64,
+    /// final セルの orig 索引集合（ゴール局所で小さい）。
+    finals: HashSet<i64>,
+}
+
+impl MapSource {
+    /// マップ + 設定済み `vi`（geometry/goal、states は不要）から構築する。`safety_radius` /
+    /// `safety_radius_penalty` は本家 penalty 式の引数（vi には保持されないので明示的に受ける）。
+    pub(crate) fn build(
+        map: &OccupancyGrid,
+        vi: &ValueIterator,
+        safety_radius: f64,
+        safety_radius_penalty: f64,
+    ) -> Self {
+        let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+        let margin = (safety_radius / vi.xy_resolution).ceil() as i32;
+        let n2d = (nx as usize) * (ny as usize);
+        let mut free = vec![false; n2d];
+        let mut pen2d = vec![0u64; n2d];
+        let mut max_pen = 0u64;
+        // 2D: free/penalty は θ 非依存なので θ=0 で 1 回だけ本家式を回す。
+        for y in 0..ny {
+            for x in 0..nx {
+                let s = State::from_occupancy(x, y, 0, map, margin, safety_radius_penalty, nx);
+                let i = (y * nx + x) as usize;
+                free[i] = s.free;
+                pen2d[i] = s.penalty; // local_penalty = 0
+                if s.penalty > max_pen {
+                    max_pen = s.penalty;
+                }
+            }
+        }
+        let finals = compute_finals(vi, &free);
+        Self { nx, ny, nt, free, pen2d, max_pen, finals }
+    }
+    #[inline]
+    fn xy(&self, ix: i32, iy: i32) -> usize {
+        (iy * self.nx + ix) as usize
+    }
+    #[inline]
+    fn orig(&self, ix: i32, iy: i32, it: i32) -> i64 {
+        (it + ix * self.nt + iy * self.nx * self.nt) as i64
+    }
+}
+
+impl StateSource for MapSource {
+    #[inline]
+    fn pen(&self, ix: i32, iy: i32) -> u64 {
+        self.pen2d[self.xy(ix, iy)]
+    }
+    #[inline]
+    fn free(&self, ix: i32, iy: i32) -> bool {
+        self.free[self.xy(ix, iy)]
+    }
+    #[inline]
+    fn is_final(&self, ix: i32, iy: i32, it: i32) -> bool {
+        self.finals.contains(&self.orig(ix, iy, it))
+    }
+    #[inline]
+    fn max_pen(&self) -> u64 {
+        self.max_pen
+    }
+    fn for_each_seed(&self, f: &mut dyn FnMut(i32, i32, i32)) {
+        let (nx, nt) = (self.nx as i64, self.nt as i64);
+        for &orig in &self.finals {
+            let it = (orig % nt) as i32;
+            let rem = orig / nt;
+            let ix = (rem % nx) as i32;
+            let iy = (rem / nx) as i32;
+            f(ix, iy, it);
+        }
+    }
+    fn for_each_free(&self, f: &mut dyn FnMut(i32, i32)) {
+        for iy in 0..self.ny {
+            for ix in 0..self.nx {
+                if self.free[self.xy(ix, iy)] {
+                    f(ix, iy);
+                }
+            }
+        }
+    }
+}
+
+/// 本家 `setStateValues` の final 判定を**ゴール近傍 bbox のみ**で再現し、final セルの orig 集合を返す。
+/// final_xy は両角 (x0,y0)/(x1,y1) がともに goal から `goal_margin_radius` 内を要求するので、bbox の
+/// 外側のセルは決して final にならない（健全な絞り込み）。bit-exact のため式は本家と完全一致させる。
+fn compute_finals(vi: &ValueIterator, free: &[bool]) -> HashSet<i64> {
+    let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+    let (xy_res, ox, oy) = (vi.xy_resolution, vi.map_origin_x, vi.map_origin_y);
+    let (gx, gy, gt, gm) = (vi.goal_x, vi.goal_y, vi.goal_t, vi.goal_margin_theta);
+    let r2 = vi.goal_margin_radius * vi.goal_margin_radius;
+    let t_res = vi.t_resolution;
+    let rad = vi.goal_margin_radius;
+    let mut set = HashSet::new();
+    if rad <= 0.0 || xy_res <= 0.0 {
+        return set;
+    }
+    // ゴール ± (rad + 1cell) の bbox（両角が rad 内 → 中心も rad 内なので必ず包含）。
+    let lo_x = (((gx - rad - ox) / xy_res).floor() as i32 - 1).max(0);
+    let hi_x = (((gx + rad - ox) / xy_res).ceil() as i32 + 1).min(nx - 1);
+    let lo_y = (((gy - rad - oy) / xy_res).floor() as i32 - 1).max(0);
+    let hi_y = (((gy + rad - oy) / xy_res).ceil() as i32 + 1).min(ny - 1);
+    for iy in lo_y..=hi_y {
+        for ix in lo_x..=hi_x {
+            if !free[(iy * nx + ix) as usize] {
+                continue;
+            }
+            let x0 = ix as f64 * xy_res + ox;
+            let y0 = iy as f64 * xy_res + oy;
+            let r0 = (x0 - gx) * (x0 - gx) + (y0 - gy) * (y0 - gy);
+            let x1 = x0 + xy_res;
+            let y1 = y0 + xy_res;
+            let r1 = (x1 - gx) * (x1 - gx) + (y1 - gy) * (y1 - gy);
+            if !(r0 < r2 && r1 < r2) {
+                continue; // final_xy 不成立。
+            }
+            for it in 0..nt {
+                let t0 = (it as f64 * t_res) as i32;
+                let t1 = ((it + 1) as f64 * t_res) as i32;
+                let goal_t_2 = if gt > 180 { gt - 360 } else { gt + 360 };
+                let ok = (gt - gm <= t0 && t1 <= gt + gm)
+                    || (goal_t_2 - gm <= t0 && t1 <= goal_t_2 + gm);
+                if ok {
+                    set.insert((it + ix * nt + iy * nx * nt) as i64);
+                }
+            }
+        }
+    }
+    set
+}
 
 /// θ マスクを円環（周期 `nt`）で ±k 膨張する（`frontier2d_sparse::rot_dilate` と同一）。回転アクション
 /// は dix=diy=0 で自セルも窓に含むため、変化 θ から `circ(θ′−θ) ≤ mt` の θ を再評価対象に広げる。
@@ -97,23 +323,25 @@ impl CpCells for BlockStore {
 }
 
 impl BlockStore {
-    /// states を 1 回スキャンして `n_eval`/`max_pen` だけ確定する（cp は materialize しない）。
-    fn new(g: &Geom, states: &[State]) -> Self {
+    /// `src` から `n_eval`/`max_pen` だけ確定する（cp は materialize しない）。n_eval は「free·nt −
+    /// final」をブロック別に集計する（1 列の全 θ は同一ブロックに収まり、final ⊆ free なので非負）。
+    /// MapSource ならこの集計は O(nx·ny)（O(total) の states 走査が不要）。
+    fn new(g: &Geom, src: &dyn StateSource) -> Self {
         let chunk = BLOCK_ROWS * g.row_stride as usize;
         let n_pad = g.n_pad();
         let nblk = n_pad.div_ceil(chunk);
-        let mut n_eval = vec![0usize; nblk];
-        let mut max_pen = 0u64;
-        for s in states {
-            let p = s.penalty.wrapping_add(s.local_penalty);
-            if p > max_pen {
-                max_pen = p;
-            }
-            if s.free && !s.final_state {
-                let pad_idx = (s.it as i64 + g.pad_col(s.ix, s.iy)) as usize;
-                n_eval[pad_idx / chunk] += 1;
-            }
-        }
+        let nt = g.nt as i64;
+        let mut acc = vec![0i64; nblk];
+        src.for_each_free(&mut |ix, iy| {
+            let blk = (g.pad_col(ix, iy) as usize) / chunk;
+            acc[blk] += nt;
+        });
+        src.for_each_seed(&mut |ix, iy, _it| {
+            let blk = (g.pad_col(ix, iy) as usize) / chunk;
+            acc[blk] -= 1;
+        });
+        let n_eval: Vec<usize> = acc.into_iter().map(|v| v as usize).collect();
+        let max_pen = src.max_pen();
         Self {
             blocks: (0..nblk).map(|_| None).collect(),
             n_final: vec![0; nblk],
@@ -131,10 +359,10 @@ impl BlockStore {
         }
     }
 
-    /// ブロック `b` を states から遅延構築する（既に確保済み/退避済みなら no-op）。`Fused::build_direct`
-    /// と同一規約: `pen = penalty +ʷ local_penalty`、`cp = total_cost +ʷ pen`（free かつ未到達でない
-    /// とき。さもなくば UNREACHED）、`eval = free && !final_state`、構造的 `fin = !eval`。
-    fn ensure_block(&mut self, b: usize, states: &[State]) {
+    /// ブロック `b` を `src` から遅延構築する（既に確保済み/退避済みなら no-op）。`Fused::build_direct`
+    /// と同一規約: `pen = penalty +ʷ local_penalty`、`cp = pen`（final セル= seed value 0、`0+ʷpen`）
+    /// さもなくば UNREACHED、`eval = free && !final`、構造的 `fin = !eval`。
+    fn ensure_block(&mut self, b: usize, src: &dyn StateSource) {
         if self.blocks[b].is_some() || self.evicted[b] {
             return;
         }
@@ -158,16 +386,16 @@ impl BlockStore {
             let ix = ix_pad as i32 - mx;
             let iy = iy_pad as i32 - my;
             if ix >= 0 && ix < nx && iy >= 0 && iy < ny {
-                let orig =
-                    it + ix as usize * nt as usize + iy as usize * nx as usize * nt as usize;
-                let s = &states[orig];
-                let p = s.penalty.wrapping_add(s.local_penalty);
+                let free = src.free(ix, iy);
+                let p = src.pen(ix, iy);
                 *penc = p;
-                let is_eval = s.free && !s.final_state;
+                let is_final = free && src.is_final(ix, iy, it as i32);
+                let is_eval = free && !is_final;
                 *evc = is_eval;
                 *finc = !is_eval;
-                if s.free && s.total_cost != MAX_COST {
-                    *cpc = s.total_cost.wrapping_add(p);
+                // seed: final セルは total_cost=0 → cp = 0 +ʷ p = p。非 final free は UNREACHED。
+                if is_final {
+                    *cpc = p;
                 }
             }
         }
@@ -315,14 +543,14 @@ fn couple_margin(g: &Geom, max_pen: u64) -> u64 {
 
 /// 列 (ix,iy) の窓（±my 行）に重なる行ブロックを全て確保する。relax/finalize で近傍 gather する前に
 /// 呼び、退避済み以外の窓ブロックを常駐させる（退避済みは interior-final なので読まれない）。
-fn ensure_window(store: &mut BlockStore, ix: i32, iy: i32, states: &[State]) {
+fn ensure_window(store: &mut BlockStore, ix: i32, iy: i32, src: &dyn StateSource) {
     let _ = ix; // 行ブロックは全 x を含むので x 窓はブロック境界を跨がない。
     let nb = store.nblocks();
     // 列のセルはパディング行 iy+my、窓は ±my → パディング行 [iy, iy+2my]、ブロック = 行/BLOCK_ROWS。
     let b_lo = iy as usize / BLOCK_ROWS;
     let b_hi = (((iy + 2 * store.my) as usize) / BLOCK_ROWS).min(nb - 1);
     for b in b_lo..=b_hi {
-        store.ensure_block(b, states);
+        store.ensure_block(b, src);
     }
 }
 
@@ -356,9 +584,9 @@ fn relax_column(
     g: &Geom,
     ix: i32,
     iy: i32,
-    states: &[State],
+    src: &dyn StateSource,
 ) -> (bool, u64, u64, u64) {
-    ensure_window(store, ix, iy, states);
+    ensure_window(store, ix, iy, src);
     let pad_col = g.pad_col(ix, iy);
     let mut changed = false;
     let mut ups = 0u64;
@@ -462,10 +690,10 @@ fn finalize_column(
     g: &Geom,
     ix: i32,
     iy: i32,
-    states: &[State],
+    src: &dyn StateSource,
     sink: &mut dyn CompactSink,
 ) -> u64 {
-    ensure_window(store, ix, iy, states);
+    ensure_window(store, ix, iy, src);
     let pad_col = g.pad_col(ix, iy);
     let (nt, nx) = (g.nt, g.nx);
     let ntu = nt as usize;
@@ -565,7 +793,7 @@ pub struct CompactStats {
 fn converge_band_serial(
     store: &mut BlockStore,
     g: &Geom,
-    states: &[State],
+    src: &dyn StateSource,
     nx: i32,
     ny: i32,
     dx: u32,
@@ -591,7 +819,7 @@ fn converge_band_serial(
             if col_final[i] {
                 continue;
             }
-            let (chg, mn, mx, ups) = relax_column(store, g, ix, iy, states);
+            let (chg, mn, mx, ups) = relax_column(store, g, ix, iy, src);
             col_min[i] = mn;
             col_max[i] = mx;
             if mn != MAX_COST && !reached[i] {
@@ -639,7 +867,7 @@ fn converge_band_serial(
 fn converge_band_async(
     store: &mut BlockStore,
     g: &Geom,
-    states: &[State],
+    src: &dyn StateSource,
     nthreads: usize,
     nx: i32,
     ny: i32,
@@ -671,7 +899,7 @@ fn converge_band_async(
     let outcome = loop {
         // ① 直列: frontier 全列の窓ブロックを確保（並列 compute 中は確保/退避できないため）。
         for &(ixu, iyu) in frontier.iter() {
-            ensure_window(store, ixu as i32, iyu as i32, states);
+            ensure_window(store, ixu as i32, iyu as i32, src);
         }
         // ② 並列 async G-S × θ疎評価。各列は 1 チャンク = 1 スレッドが排他担当（単一書き手）。
         //    戻り値は評価した列の `(i, mn, mx, ups, cmask)`。view/mask は本スコープ中 store を
@@ -814,6 +1042,94 @@ pub(crate) fn solve_compact_into_nthreads(
     nthreads: usize,
 ) -> CompactStats {
     let g = Geom::build(vi);
+    let mt = displacement(vi).2;
+    // states を源にバンドスキャンを回す（src の借用は core 内で完結し、write_back と競合しない）。
+    let mut stats = {
+        let src = SliceSource::new(&vi.states, g.nx, g.nt);
+        solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads)
+    };
+    write_back_sink(vi, &g, sink);
+    // slice 経路は states があるので reachable を厳密にカウント（mapped 経路は core 内の finalized）。
+    stats.reachable = vi
+        .states
+        .iter()
+        .filter(|s| s.free && !s.final_state && s.total_cost < MAX_COST)
+        .count() as u64;
+    stats
+}
+
+/// マップ + ゴールから **states を構築せず**ブロックタイル・アウトオブコアで解く（メモリ床を O(nx·ny)
+/// に下げる）。`vi.states`（O(total)）を一切確保せず、geometry/transitions だけ持つ `ValueIterator`
+/// を作り `MapSource` を源にする。出力は `sink`（ディスク mmap 推奨）に確定し、write_back はしない
+/// （結果は sink にある）。到達可能セルの収束値・方策は slice 経路（= 本家）と bit-exact。
+#[allow(clippy::too_many_arguments)]
+pub fn solve_compact_mapped(
+    actions: Vec<Action>,
+    thread_num: i32,
+    map: &OccupancyGrid,
+    theta_cell_num: i32,
+    safety_radius: f64,
+    safety_radius_penalty: f64,
+    goal_margin_radius: f64,
+    goal_margin_theta: i32,
+    goal_x: f64,
+    goal_y: f64,
+    goal_t: i32,
+    max_iter: u32,
+    band_override: Option<u64>,
+    sink: &mut dyn CompactSink,
+    nthreads: usize,
+) -> CompactStats {
+    let mut vi = ValueIterator::new(actions, thread_num);
+    // geometry + transitions のみ（states / sweep_orders は作らない = O(total) 確保なし）。
+    vi.set_map_geometry_no_states(map, theta_cell_num, goal_margin_radius, goal_margin_theta);
+    // ゴール設定（states は空なので set_state_values は no-op、goal フィールドだけ更新）。
+    vi.set_goal(goal_x, goal_y, goal_t);
+    let g = Geom::build(&vi);
+    let mt = displacement(&vi).2;
+    let src = MapSource::build(map, &vi, safety_radius, safety_radius_penalty);
+    solve_compact_core(&g, mt, &src, max_iter, band_override, sink, nthreads)
+}
+
+/// 既定スレッド数（環境変数 `VI_THREADS` 上書き可）。`solve_compact_mapped` にスレッド数を渡すための
+/// 公開ヘルパ（内部 `n_threads()` は crate 内可視のため）。
+pub fn default_threads() -> usize {
+    n_threads()
+}
+
+/// states を作らず goal(final) セル数を数える（bench のサニティ表示用、O(nx·ny)）。geometry-only vi +
+/// MapSource を構築して final 集合サイズを返す。
+#[allow(clippy::too_many_arguments)]
+pub fn mapped_goal_cell_count(
+    actions: Vec<Action>,
+    map: &OccupancyGrid,
+    theta_cell_num: i32,
+    safety_radius: f64,
+    safety_radius_penalty: f64,
+    goal_margin_radius: f64,
+    goal_margin_theta: i32,
+    goal_x: f64,
+    goal_y: f64,
+    goal_t: i32,
+) -> usize {
+    let mut vi = ValueIterator::new(actions, 1);
+    vi.set_map_geometry_no_states(map, theta_cell_num, goal_margin_radius, goal_margin_theta);
+    vi.set_goal(goal_x, goal_y, goal_t);
+    MapSource::build(map, &vi, safety_radius, safety_radius_penalty).finals.len()
+}
+
+/// バンドスキャン本体（源 `src` 非依存）。`slice`/`mapped` 両入口が共有する。出力は `sink` に確定し、
+/// write_back はしない（呼び出し側の責務）。`reachable` は finalized 数で近似（slice 入口が上書きする）。
+#[allow(clippy::too_many_arguments)]
+fn solve_compact_core(
+    g: &Geom,
+    mt: i32,
+    src: &dyn StateSource,
+    max_iter: u32,
+    band_override: Option<u64>,
+    sink: &mut dyn CompactSink,
+    nthreads: usize,
+) -> CompactStats {
     let (nx, ny) = (g.nx, g.ny);
     let (dx, dy) = (g.mx as u32, g.my as u32);
     let ncol = (nx * ny) as usize;
@@ -823,7 +1139,6 @@ pub(crate) fn solve_compact_into_nthreads(
 
     // θ マスク疎評価（並列 async 経路のみ）。変化 θ ビットマスク (u64) の padding 付き 2D 配列。
     // O(ncol) u64（cp の 1/nt）で、compact が常駐させる col_* 配列と同オーダー。`mt` は θ 円環膨張半径。
-    let mt = displacement(vi).2;
     assert!(g.nt <= 64, "θ マスクは u64 前提 (nt={})", g.nt);
     let mw = (nx + 2 * g.mx) as usize;
     let full_mask: u64 = if g.nt >= 64 { u64::MAX } else { (1u64 << g.nt) - 1 };
@@ -840,15 +1155,15 @@ pub(crate) fn solve_compact_into_nthreads(
     let mut peak_resident_blocks = 0u64;
     let mut freed_blocks = 0u64;
 
-    // 初期フロンティア（ゴール列を依存窓で膨張）。vi の借用はここで終わる。
-    let mut frontier: Vec<(u32, u32)> = seed_frontier_2d(vi).dilate(dx, dy).enumerate().collect();
+    // 初期フロンティア（ゴール列を依存窓で膨張）。seed は src.for_each_seed（ゴール局所）から作る。
+    let mut seed_bb = Bitboard2D::new(nx as u32, ny as u32);
+    src.for_each_seed(&mut |ix, iy, _it| seed_bb.set(ix as u32, iy as u32));
+    let mut frontier: Vec<(u32, u32)> = seed_bb.dilate(dx, dy).enumerate().collect();
 
-    // states を借用して遅延構築のソースにする（write_back は loop 後なので競合しない）。
-    let states: &[State] = &vi.states;
-    let mut store = BlockStore::new(&g, states);
-    let band = band_override.unwrap_or_else(|| couple_margin(&g, store.max_pen));
+    let mut store = BlockStore::new(g, src);
+    let band = band_override.unwrap_or_else(|| couple_margin(g, store.max_pen));
 
-    // 列ごとの現在値域と final フラグ。初期値域は states スキャンで（ブロックを構築せず）作る。
+    // 列ごとの現在値域と final フラグ。seed セル（final、value=0）で初期化する。
     // `live` = 到達済み（`col_min != MAX`）かつ非 final の列インデックス集合。波ごとの
     // finalize/再活性/終了判定/常駐ピークは全列 O(ncol) 走査ではなく `live` の反復で行う
     // （バンド ≪ 全グリッドなので走査が O(band) になる）。`reached` で二重 push を防ぐ。
@@ -857,21 +1172,15 @@ pub(crate) fn solve_compact_into_nthreads(
     let mut col_final = vec![false; ncol];
     let mut reached = vec![false; ncol];
     let mut live: Vec<usize> = Vec::new();
-    for s in states {
-        if s.free && s.total_cost < MAX_COST {
-            let i = cidx(s.ix, s.iy);
-            let v = s.total_cost; // value = cp − pen = total_cost
-            if !reached[i] {
-                reached[i] = true;
-                live.push(i);
-                col_min[i] = v;
-                col_max[i] = v;
-            } else {
-                col_min[i] = col_min[i].min(v);
-                col_max[i] = col_max[i].max(v);
-            }
+    src.for_each_seed(&mut |ix, iy, _it| {
+        let i = cidx(ix, iy);
+        if !reached[i] {
+            reached[i] = true;
+            live.push(i);
+            col_min[i] = 0; // seed value = total_cost = 0
+            col_max[i] = 0;
         }
-    }
+    });
 
     let mut t = band;
     let converged = 'outer: loop {
@@ -880,13 +1189,13 @@ pub(crate) fn solve_compact_into_nthreads(
         //    'outer を false で抜ける。 ──
         let band_ok = if nthreads >= 2 {
             converge_band_async(
-                &mut store, &g, states, nthreads, nx, ny, dx, dy, t, max_iter, &mut frontier,
+                &mut store, g, src, nthreads, nx, ny, dx, dy, t, max_iter, &mut frontier,
                 &mut col_min, &mut col_max, &col_final, &mut reached, &mut live, &mut iters,
                 &mut total_updates, &mut mask, mw, mt, full_mask,
             )
         } else {
             converge_band_serial(
-                &mut store, &g, states, nx, ny, dx, dy, t, max_iter, &mut frontier, &mut col_min,
+                &mut store, g, src, nx, ny, dx, dy, t, max_iter, &mut frontier, &mut col_min,
                 &mut col_max, &col_final, &mut reached, &mut live, &mut iters, &mut total_updates,
             )
         };
@@ -903,7 +1212,7 @@ pub(crate) fn solve_compact_into_nthreads(
             if col_max[i] <= wm {
                 let ix = (i % nx as usize) as i32;
                 let iy = (i / nx as usize) as i32;
-                finalized += finalize_column(&mut store, &g, ix, iy, states, sink);
+                finalized += finalize_column(&mut store, g, ix, iy, src, sink);
                 col_final[i] = true;
                 touched_blocks.push((iy + store.my) as usize / BLOCK_ROWS);
             }
@@ -965,15 +1274,8 @@ pub(crate) fn solve_compact_into_nthreads(
     };
 
     let total_blocks = store.nblocks() as u64;
-    drop(store); // 残常駐ブロックも解放（出力は sink に確定済み）。states 借用もここで終わる。
+    drop(store); // 残常駐ブロックも解放（出力は sink に確定済み）。src 借用もここで終わる。
 
-    write_back_sink(vi, &g, sink);
-
-    let reachable = vi
-        .states
-        .iter()
-        .filter(|s| s.free && !s.final_state && s.total_cost < MAX_COST)
-        .count() as u64;
     let reachable_cols = (0..ncol).filter(|&i| col_max[i] != MAX_COST).count() as u64;
 
     CompactStats {
@@ -981,7 +1283,8 @@ pub(crate) fn solve_compact_into_nthreads(
         updates: total_updates,
         converged,
         finalized,
-        reachable,
+        // 収束時は finalized == 到達可能 eval セル数。slice 入口は states から厳密値で上書きする。
+        reachable: finalized,
         peak_resident_cols,
         reachable_cols,
         freed_blocks,
@@ -1176,5 +1479,194 @@ mod tests {
             "peak 常駐ブロックが総ブロックを下回るべき (peak={}, total={})",
             stats.peak_resident_blocks, stats.total_blocks
         );
+    }
+
+    /// MapSource（2D free/penalty + ゴール局所 final）が materialized states と per-cell で bit-exact
+    /// 一致することを検証（compact のメモリ床撤去の健全性の土台）。pen/free/is_final/max_pen/seed/free
+    /// 集合が全 (ix,iy,it) で SliceSource と一致する。
+    #[test]
+    fn mapsource_matches_materialized_states() {
+        use crate::action::Action;
+        use crate::msg::OccupancyGrid;
+        use crate::value_iterator::ValueIterator;
+
+        let actions = || {
+            vec![
+                Action::new("forward", 0.3, 0.0, 0),
+                Action::new("back", -0.2, 0.0, 1),
+                Action::new("right", 0.0, -20.0, 2),
+                Action::new("rightfw", 0.2, -20.0, 3),
+                Action::new("left", 0.0, 20.0, 4),
+                Action::new("leftfw", 0.2, 20.0, 5),
+            ]
+        };
+        // 障害物入りマップ（penalty margin / free を非自明にする）。
+        let (w, h) = (10i32, 8i32);
+        let mut data = vec![0i8; (w * h) as usize];
+        data[(2 * w + 3) as usize] = 100;
+        data[(5 * w + 6) as usize] = 100;
+        let map = OccupancyGrid {
+            width: w,
+            height: h,
+            resolution: 0.05,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Default::default(),
+            data,
+        };
+        let (sr, srp, gmr, gmt) = (0.2, 30.0, 0.3, 15);
+
+        let mut vi = ValueIterator::new(actions(), 1);
+        vi.set_map_with_occupancy_grid(&map, 60, sr, srp, gmr, gmt);
+        vi.set_goal(0.10, 0.10, 0);
+
+        let slice = SliceSource::new(&vi.states, vi.cell_num_x, vi.cell_num_t);
+        let mapsrc = MapSource::build(&map, &vi, sr, srp);
+        let (nx, ny, nt) = (vi.cell_num_x, vi.cell_num_y, vi.cell_num_t);
+
+        for iy in 0..ny {
+            for ix in 0..nx {
+                assert_eq!(mapsrc.free(ix, iy), slice.free(ix, iy), "free @ ({ix},{iy})");
+                assert_eq!(mapsrc.pen(ix, iy), slice.pen(ix, iy), "pen @ ({ix},{iy})");
+                for it in 0..nt {
+                    assert_eq!(
+                        mapsrc.is_final(ix, iy, it),
+                        slice.is_final(ix, iy, it),
+                        "is_final @ ({ix},{iy},{it})"
+                    );
+                }
+            }
+        }
+        assert_eq!(mapsrc.max_pen(), slice.max_pen(), "max_pen");
+
+        let mut sset: HashSet<(i32, i32, i32)> = HashSet::new();
+        slice.for_each_seed(&mut |ix, iy, it| {
+            sset.insert((ix, iy, it));
+        });
+        let mut mset: HashSet<(i32, i32, i32)> = HashSet::new();
+        mapsrc.for_each_seed(&mut |ix, iy, it| {
+            mset.insert((ix, iy, it));
+        });
+        assert_eq!(mset, sset, "seed set");
+        assert!(!sset.is_empty(), "goal final セルが存在するはず");
+
+        let mut sf: HashSet<(i32, i32)> = HashSet::new();
+        slice.for_each_free(&mut |ix, iy| {
+            sf.insert((ix, iy));
+        });
+        let mut mf: HashSet<(i32, i32)> = HashSet::new();
+        mapsrc.for_each_free(&mut |ix, iy| {
+            mf.insert((ix, iy));
+        });
+        assert_eq!(mf, sf, "free col set");
+    }
+
+    /// `set_map_geometry_no_states` が geometry/transitions を整えつつ states/sweep_orders を一切
+    /// 確保しないこと（メモリ床撤去の核）。
+    #[test]
+    fn geometry_no_states_leaves_states_empty() {
+        use crate::msg::OccupancyGrid;
+        use crate::value_iterator::ValueIterator;
+        let map = OccupancyGrid {
+            width: 6,
+            height: 5,
+            resolution: 0.05,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Default::default(),
+            data: vec![0i8; 30],
+        };
+        let mut vi = ValueIterator::new(crate::solvers::test_support::actions(), 1);
+        vi.set_map_geometry_no_states(&map, 60, 0.3, 15);
+        assert!(vi.states.is_empty(), "states を確保してはいけない");
+        assert!(vi.sweep_orders.is_empty(), "sweep_orders を確保してはいけない");
+        assert_eq!(vi.cell_num_x, 6);
+        assert_eq!(vi.cell_num_y, 5);
+        assert_eq!(vi.cell_num_t, 60);
+        // 遷移テーブルは構築済み（Geom::build / displacement に必要）。
+        assert!(vi.actions.iter().all(|a| !a.state_transitions.is_empty()));
+    }
+
+    /// mapped 経路（states を作らない）が Reference 固定点と到達可能セルで bit-exact（value+policy）。
+    /// 出力は sink から読む（write_back しない）。nthreads を引数で固定（1=直列 / 4=並列 async）。
+    fn assert_mapped_parity(w: i32, h: i32, occ: Vec<i8>, nthreads: usize) {
+        use crate::msg::OccupancyGrid;
+        use crate::solvers::test_support::{actions, make_vi, run_reference_to_fixed_point, REACH};
+
+        let mut a = make_vi(w, h, occ.clone());
+        run_reference_to_fixed_point(&mut a);
+
+        let map = OccupancyGrid {
+            width: w,
+            height: h,
+            resolution: 0.05,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_quat: Default::default(),
+            data: occ,
+        };
+        let mut sink = RamSink::new((w * h * 60) as usize);
+        // make_vi と同一パラメータ: theta=60, sr=0.2, srp=30.0, gmr=0.3, gmt=15, goal(0.10,0.10,0)。
+        let s = solve_compact_mapped(
+            actions(), 1, &map, 60, 0.2, 30.0, 0.3, 15, 0.10, 0.10, 0, 4000, None, &mut sink,
+            nthreads,
+        );
+        assert!(s.converged, "mapped solver must converge (nthreads={nthreads})");
+
+        let mut n_reach = 0u64;
+        for i in 0..a.states.len() {
+            if a.states[i].total_cost < REACH {
+                n_reach += 1;
+                let (v, act) = sink.read(i);
+                assert_eq!(
+                    v, a.states[i].total_cost,
+                    "value mismatch @ state {i} (ix={},iy={},it={}, nthreads={nthreads})",
+                    a.states[i].ix, a.states[i].iy, a.states[i].it
+                );
+                let act_opt = if act < 0 { None } else { Some(act as usize) };
+                assert_eq!(
+                    act_opt, a.states[i].optimal_action,
+                    "policy mismatch @ state {i} (ix={},iy={},it={}, nthreads={nthreads})",
+                    a.states[i].ix, a.states[i].iy, a.states[i].it
+                );
+            }
+        }
+        assert!(n_reach > 0, "到達可能セルが存在するはず");
+    }
+
+    /// 標準3マップで mapped == Reference（直列）。
+    #[test]
+    fn parity_mapped_standard_maps_nthreads1() {
+        assert_mapped_parity(8, 8, vec![0i8; 64], 1);
+        let mut occ = vec![0i8; 64];
+        for iy in 0..8 {
+            occ[(iy * 8 + 5) as usize] = 100;
+        }
+        occ[5] = 0;
+        assert_mapped_parity(8, 8, occ, 1);
+        let mut occ = vec![0i8; 64];
+        occ[8 + 2] = 100;
+        occ[3 * 8 + 2] = 100;
+        occ[2 * 8 + 1] = 100;
+        assert_mapped_parity(8, 8, occ, 1);
+    }
+
+    /// 標準3マップで mapped == Reference（並列 async G-S, nthreads=4）。
+    #[test]
+    fn parity_mapped_standard_maps_nthreads4() {
+        assert_mapped_parity(8, 8, vec![0i8; 64], 4);
+        let mut occ = vec![0i8; 64];
+        for iy in 0..8 {
+            occ[(iy * 8 + 5) as usize] = 100;
+        }
+        occ[5] = 0;
+        assert_mapped_parity(8, 8, occ, 4);
+    }
+
+    /// 複数行ブロック × 並列 async（nthreads=4）で mapped == Reference（チャンク境界・退避を刺激）。
+    #[test]
+    fn parity_mapped_larger_nthreads4() {
+        let (w, h) = (32, 24);
+        assert_mapped_parity(w, h, vec![0i8; (w * h) as usize], 4);
     }
 }
